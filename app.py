@@ -430,7 +430,10 @@ def page_login():
 def admin_event_builder():
     st.subheader("🛠️ Конструктор подій")
     events = get_events()
-    options = ["➕ Створити нову подію"] + (events["title"] + " (#" + events["id"].astype(str) + ")").tolist()
+    options = ["➕ Створити нову подію"] + [
+        f"{(row['title'] if row['title'] else '(без назви)')} (#{row['id']})"
+        for _, row in events.iterrows()
+    ]
     choice = st.selectbox("Подія", options)
 
     editing_id = None
