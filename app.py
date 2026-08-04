@@ -1,12 +1,32 @@
+# -*- coding: utf-8 -*-
+"""
+CampusBridge — платформа студентських челенджів та хакатонів
+Один файл, Python + Streamlit + SQLite.
+
+Запуск:
+    pip install streamlit pandas openpyxl
+    streamlit run campusbridge.py
+
+Дефолтний адмін: логін "admin", пароль "admin123"
+"""
+
 import streamlit as st
 import sqlite3
 import pandas as pd
 import hashlib
 import datetime
+from datetime import timedelta
 import io
 import random
 import string
 import statistics
+import uuid
+
+try:
+    from streamlit_calendar import calendar as st_calendar
+    CALENDAR_AVAILABLE = True
+except ImportError:
+    CALENDAR_AVAILABLE = False
 
 # ============================================================
 # КОНСТАНТИ
@@ -160,6 +180,10 @@ def init_db():
     existing_cols = [row[1] for row in c.fetchall()]
     if "double_blind" not in existing_cols:
         c.execute("ALTER TABLE events ADD COLUMN double_blind INTEGER DEFAULT 0")
+    if "banner_url" not in existing_cols:
+        c.execute("ALTER TABLE events ADD COLUMN banner_url TEXT")
+    if "video_url" not in existing_cols:
+        c.execute("ALTER TABLE events ADD COLUMN video_url TEXT")
     conn.commit()
 
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
@@ -292,6 +316,93 @@ def detect_anomalies(event_id):
     return pd.DataFrame(anomalies)
 
 
+def parse_date_flexible(text):
+    """Намагається розпізнати дату/час у кількох поширених форматах."""
+    if not text or not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    formats = ["%Y-%m-%d %H:%M", "%Y-%m-%d", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+               "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M", "%d/%m/%Y"]
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_prize_fund(text):
+    """Витягує число із рядка призового фонду для сортування (наприклад, '50 000 грн' -> 50000)."""
+    if not text:
+        return None
+    digits = "".join(ch for ch in str(text) if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _escape_ics(text):
+    if not text:
+        return ""
+    return (str(text).replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def build_ics_for_event(ev):
+    """Формує вміст .ics файлу з усіма ключовими дедлайнами події."""
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//CampusBridge//UA//"]
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    milestones = [
+        ("Старт реєстрації", ev.get("reg_start")),
+        ("Дедлайн подачі заявок", ev.get("reg_end")),
+        ("Старт хакатону/події", ev.get("event_start")),
+        ("Дедлайн пітчингу", ev.get("pitch_deadline")),
+    ]
+    added_any = False
+    for label, date_str in milestones:
+        dt = parse_date_flexible(date_str)
+        if not dt:
+            continue
+        added_any = True
+        has_time = ":" in (date_str or "") and dt.hour + dt.minute > 0
+        summary = f"{label}: {ev.get('title', '')}"
+        description = ev.get("description") or ""
+        if has_time:
+            dtstart = dt.strftime("%Y%m%dT%H%M%S")
+            dtend = (dt + timedelta(hours=1)).strftime("%Y%m%dT%H%M%S")
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{uuid.uuid4()}@campusbridge",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART:{dtstart}",
+                f"DTEND:{dtend}",
+                f"SUMMARY:{_escape_ics(summary)}",
+                f"DESCRIPTION:{_escape_ics(description)}",
+                "END:VEVENT",
+            ]
+        else:
+            dtstart = dt.strftime("%Y%m%d")
+            dtend = (dt + timedelta(days=1)).strftime("%Y%m%d")
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{uuid.uuid4()}@campusbridge",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART;VALUE=DATE:{dtstart}",
+                f"DTEND;VALUE=DATE:{dtend}",
+                f"SUMMARY:{_escape_ics(summary)}",
+                f"DESCRIPTION:{_escape_ics(description)}",
+                "END:VEVENT",
+            ]
+    lines.append("END:VCALENDAR")
+    if not added_any:
+        return None
+    return "\r\n".join(lines)
+
+
+def youtube_embed_url(url):
+    """Приймає посилання на YouTube у різних форматах і повертає його як є (st.video сам розпізнає)."""
+    return url.strip() if url else None
+
+
 def anon_code(team_id):
     """Детермінований анонімний код команди для сліпого оцінювання."""
     h = hashlib.md5(f"team-anon-{team_id}".encode("utf-8")).hexdigest()[:5].upper()
@@ -328,38 +439,135 @@ def logout():
 # ============================================================
 
 def page_calendar():
-    st.subheader("📅 Календар та подій")
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    st.subheader("📅 Календар подій")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
         status_f = st.selectbox("Статус", ["Усі"] + EVENT_STATUSES)
-    with col2:
+    with f2:
         cat_f = st.selectbox("Категорія", ["Усі"] + CATEGORIES)
-    with col3:
+    with f3:
         format_f = st.selectbox("Формат", ["Усі"] + FORMATS)
 
+    f4, f5 = st.columns([2, 1])
+    with f4:
+        search_q = st.text_input("🔎 Пошук за назвою або ключовими словами в описі")
+    with f5:
+        sort_by = st.selectbox("Сортувати", ["За датою старту (найближчі)", "За призовим фондом (спадання)"])
+
     events = get_events(status_f, cat_f, format_f)
+
+    if search_q.strip():
+        q = search_q.strip().lower()
+        mask = events["title"].fillna("").str.lower().str.contains(q) | \
+               events["description"].fillna("").str.lower().str.contains(q) | \
+               events["regulations"].fillna("").str.lower().str.contains(q)
+        events = events[mask]
+
     if events.empty:
         st.info("Подій за обраними фільтрами не знайдено.")
         return
 
-    for _, ev in events.iterrows():
-        with st.container(border=True):
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                st.markdown(f"### {ev['title']}")
-                st.caption(f"{ev['category']} · {ev['format']} · {ev['status']}")
-                st.write(ev["description"] or "")
-                st.write(f"🗓️ Реєстрація: {ev['reg_start']} → {ev['reg_end']} | Старт: {ev['event_start']}")
-            with c2:
-                if ev["prize_fund"]:
-                    st.metric("Призовий фонд", ev["prize_fund"])
-                teams_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev["id"],))[0]
-                st.metric("Команд подано", teams_count)
-            with st.expander("Регламент і деталі"):
-                st.write(ev["regulations"] or "Регламент не завантажено.")
-                noms = query_df("SELECT name FROM nominations WHERE event_id=?", (ev["id"],))
-                if not noms.empty:
-                    st.write("**Номінації:** " + ", ".join(noms["name"].tolist()))
+    events = events.copy()
+    if sort_by == "За датою старту (найближчі)":
+        events["_sort_dt"] = events["event_start"].apply(lambda x: parse_date_flexible(x) or datetime.datetime.max)
+        events = events.sort_values("_sort_dt")
+    else:
+        events["_sort_prize"] = events["prize_fund"].apply(lambda x: parse_prize_fund(x) or -1)
+        events = events.sort_values("_sort_prize", ascending=False)
+
+    tab_list, tab_calendar = st.tabs(["📋 Список подій", "🗓️ Календарна сітка"])
+
+    with tab_list:
+        for _, ev in events.iterrows():
+            with st.container(border=True):
+                if ev.get("banner_url"):
+                    st.image(ev["banner_url"], use_container_width=True)
+
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"### {ev['title']}")
+                    st.caption(f"{ev['category']} · {ev['format']} · {ev['status']}")
+                    st.write(ev["description"] or "")
+                    st.write(f"🗓️ Реєстрація: {ev['reg_start']} → {ev['reg_end']} | Старт: {ev['event_start']}")
+                with c2:
+                    if ev["prize_fund"]:
+                        st.metric("Призовий фонд", ev["prize_fund"])
+                    teams_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev["id"],))[0]
+                    st.metric("Команд подано", teams_count)
+
+                if ev.get("video_url"):
+                    with st.expander("🎬 Промо-відео"):
+                        st.video(youtube_embed_url(ev["video_url"]))
+
+                ics_content = build_ics_for_event(ev)
+                if ics_content:
+                    st.download_button(
+                        "📆 Додати дедлайни в календар (.ics)",
+                        data=ics_content,
+                        file_name=f"{ev['title'][:40].replace(' ', '_')}.ics",
+                        mime="text/calendar",
+                        key=f"ics_{ev['id']}",
+                    )
+                else:
+                    st.caption("Дати події ще не вказані у форматі, придатному для експорту в календар.")
+
+                with st.expander("Регламент і деталі"):
+                    st.write(ev["regulations"] or "Регламент не завантажено.")
+                    noms = query_df("SELECT name FROM nominations WHERE event_id=?", (ev["id"],))
+                    if not noms.empty:
+                        st.write("**Номінації:** " + ", ".join(noms["name"].tolist()))
+
+    with tab_calendar:
+        if not CALENDAR_AVAILABLE:
+            st.warning("Для інтерактивного календаря встановіть пакет: `pip install streamlit-calendar`")
+        else:
+            category_colors = {
+                "IT": "#4F8BF9", "Наука": "#8E44AD", "Спорт": "#27AE60",
+                "Волонтерство": "#E67E22", "Бізнес/Кейси": "#E74C3C",
+            }
+            cal_events = []
+            for _, ev in events.iterrows():
+                start_dt = parse_date_flexible(ev["event_start"]) or parse_date_flexible(ev["reg_start"])
+                if not start_dt:
+                    continue
+                cal_events.append({
+                    "title": ev["title"],
+                    "start": start_dt.strftime("%Y-%m-%d"),
+                    "end": start_dt.strftime("%Y-%m-%d"),
+                    "color": category_colors.get(ev["category"], "#4F8BF9"),
+                })
+                reg_start_dt = parse_date_flexible(ev["reg_start"])
+                if reg_start_dt:
+                    cal_events.append({
+                        "title": f"🟢 Старт реєстрації: {ev['title']}",
+                        "start": reg_start_dt.strftime("%Y-%m-%d"),
+                        "end": reg_start_dt.strftime("%Y-%m-%d"),
+                        "color": "#95A5A6",
+                    })
+                pitch_dt = parse_date_flexible(ev["pitch_deadline"])
+                if pitch_dt:
+                    cal_events.append({
+                        "title": f"🏁 Пітчинг: {ev['title']}",
+                        "start": pitch_dt.strftime("%Y-%m-%d"),
+                        "end": pitch_dt.strftime("%Y-%m-%d"),
+                        "color": "#F1C40F",
+                    })
+
+            if not cal_events:
+                st.info("Немає подій із розпізнаваними датами (очікуваний формат: ГГГГ-ММ-ДД).")
+            else:
+                cal_options = {
+                    "initialView": "dayGridMonth",
+                    "headerToolbar": {
+                        "left": "prev,next today",
+                        "center": "title",
+                        "right": "dayGridMonth,timeGridWeek,listMonth",
+                    },
+                    "locale": "uk",
+                    "height": 650,
+                }
+                st_calendar(events=cal_events, options=cal_options, key="campusbridge_calendar")
 
 
 def page_leaderboard():
@@ -478,11 +686,11 @@ def admin_event_builder():
         cols = ["id","title","category","format","description","regulations","reg_start","reg_end",
                 "event_start","pitch_deadline","min_team","max_team","prize_fund","status",
                 "leaderboard_live","avoid_conflict","university","faculty","created_by","created_at",
-                "double_blind"]
+                "double_blind","banner_url","video_url"]
         ev = dict(zip(cols, ev))
     else:
         ev = {c: "" for c in ["title","category","format","description","regulations",
-                               "prize_fund"]}
+                               "prize_fund","banner_url","video_url"]}
         ev.update({"status": "Чернетка", "min_team": 2, "max_team": 5,
                    "leaderboard_live": 0, "avoid_conflict": 1, "double_blind": 0,
                    "university": MAIN_UNIVERSITY, "faculty": MAIN_FACULTY})
@@ -529,6 +737,13 @@ def admin_event_builder():
             help="Команди відображатимуться журі під анонімним кодом (наприклад, «Команда №A1B2»). "
                  "Захист від конфлікту інтересів за факультетом продовжує діяти автоматично, навіть якщо факультет прихований.")
 
+        st.markdown("**Медіа**")
+        m1, m2 = st.columns(2)
+        with m1:
+            banner_url = st.text_input("Посилання на банер (URL зображення)", value=ev.get("banner_url") or "")
+        with m2:
+            video_url = st.text_input("Посилання на промо-відео (YouTube)", value=ev.get("video_url") or "")
+
         submitted = st.form_submit_button("💾 Зберегти подію")
         if submitted:
             if not title:
@@ -537,21 +752,22 @@ def admin_event_builder():
                 if editing_id:
                     execute("""UPDATE events SET title=?, category=?, format=?, description=?, regulations=?,
                                reg_start=?, reg_end=?, event_start=?, pitch_deadline=?, min_team=?, max_team=?,
-                               prize_fund=?, status=?, leaderboard_live=?, avoid_conflict=?, double_blind=? WHERE id=?""",
+                               prize_fund=?, status=?, leaderboard_live=?, avoid_conflict=?, double_blind=?,
+                               banner_url=?, video_url=? WHERE id=?""",
                             (title, category, fmt, description, regulations, reg_start, reg_end, event_start,
                              pitch_deadline, min_team, max_team, prize, status, int(leaderboard_live),
-                             int(avoid_conflict), int(double_blind), editing_id))
+                             int(avoid_conflict), int(double_blind), banner_url, video_url, editing_id))
                     st.success("Подію оновлено.")
                 else:
                     new_id = execute("""INSERT INTO events (title,category,format,description,regulations,
                                         reg_start,reg_end,event_start,pitch_deadline,min_team,max_team,prize_fund,
                                         status,leaderboard_live,avoid_conflict,university,faculty,created_by,created_at,
-                                        double_blind)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        double_blind,banner_url,video_url)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                      (title, category, fmt, description, regulations, reg_start, reg_end,
                                       event_start, pitch_deadline, min_team, max_team, prize, status,
                                       int(leaderboard_live), int(avoid_conflict), MAIN_UNIVERSITY, MAIN_FACULTY,
-                                      st.session_state.user["id"], now(), int(double_blind)))
+                                      st.session_state.user["id"], now(), int(double_blind), banner_url, video_url))
                     st.success(f"Подію створено (ID {new_id}).")
                 st.rerun()
 
@@ -863,7 +1079,8 @@ def admin_import_export():
             st.error(f"Помилка обробки файлу: {e}")
 
     st.markdown("#### Імпорт подій (масове створення)")
-    st.caption("Очікувані колонки: title, category, format, description, status")
+    st.caption("Очікувані колонки: title, category, format, description, status, "
+               "reg_start, reg_end, event_start, pitch_deadline, prize_fund, banner_url, video_url (необов'язково)")
     up2 = st.file_uploader("Завантажте CSV або Excel файл із подіями", type=["csv", "xlsx"], key="import_events")
     if up2 is not None:
         try:
@@ -877,11 +1094,14 @@ def admin_import_export():
                 for _, r in imp_df2.iterrows():
                     execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
                                event_start,pitch_deadline,min_team,max_team,prize_fund,status,leaderboard_live,
-                               avoid_conflict,university,faculty,created_by,created_at,double_blind)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               avoid_conflict,university,faculty,created_by,created_at,double_blind,banner_url,video_url)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (r.get("title"), r.get("category", "IT"), r.get("format", "Онлайн"),
-                             r.get("description", ""), "", "", "", "", "", 2, 5, "", r.get("status", "Чернетка"),
-                             0, 1, MAIN_UNIVERSITY, MAIN_FACULTY, st.session_state.user["id"], now(), 0))
+                             r.get("description", ""), "", r.get("reg_start", ""), r.get("reg_end", ""),
+                             r.get("event_start", ""), r.get("pitch_deadline", ""), 2, 5,
+                             r.get("prize_fund", ""), r.get("status", "Чернетка"),
+                             0, 1, MAIN_UNIVERSITY, MAIN_FACULTY, st.session_state.user["id"], now(), 0,
+                             r.get("banner_url", ""), r.get("video_url", "")))
                     count += 1
                 st.success(f"Імпортовано {count} подій(ї).")
         except Exception as e:
