@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+CampusBridge — платформа студентських челенджів та хакатонів
+Один файл, Python + Streamlit + SQLite.
+
+Запуск:
+    pip install streamlit pandas openpyxl
+    streamlit run campusbridge.py
+
+Дефолтний адмін: логін "admin", пароль "admin123"
+"""
+
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -170,6 +182,23 @@ def init_db():
             ("admin", hash_pw("admin123"), "admin", "Адміністратор системи",
              "admin@vspu.edu.ua", MAIN_UNIVERSITY, MAIN_FACULTY, now()))
         conn.commit()
+
+    # демо-акаунти для тестування ролей журі, ментора та учасника
+    demo_accounts = [
+        ("jury_demo", "jury123", "jury", "Ірина Оцінювачева (демо-журі)",
+         "jury_demo@vspu.edu.ua", MAIN_FACULTY),
+        ("mentor_demo", "mentor123", "mentor", "Олег Ментор (демо-ментор)",
+         "mentor_demo@vspu.edu.ua", "IT-індустрія / ФМФКН"),
+        ("participant_demo", "part123", "participant", "Марія Учасниця (демо-учасник)",
+         "participant_demo@vspu.edu.ua", MAIN_FACULTY),
+    ]
+    for username, pw, role, full_name, email, faculty in demo_accounts:
+        c.execute("SELECT id FROM users WHERE username=?", (username,))
+        if c.fetchone() is None:
+            c.execute("""INSERT INTO users (username,password,role,full_name,email,university,faculty,created_at)
+                         VALUES (?,?,?,?,?,?,?,?)""",
+                      (username, hash_pw(pw), role, full_name, email, MAIN_UNIVERSITY, faculty, now()))
+    conn.commit()
     conn.close()
 
 
@@ -406,7 +435,17 @@ def page_login():
                     st.rerun()
                 else:
                     st.error("Невірний логін або пароль.")
-        st.caption("Обліковий запис адміністратора, журі та менторів створюються адміністратором системи (демо-адмін: admin / admin123).")
+        st.caption("Нові облікові записи журі та менторів створює адміністратор системи "
+                   "(розділи «⚖️ Журі» та «🧑‍🏫 Ментори»).")
+        with st.expander("🔑 Демо-облікові записи для тестування всіх ролей"):
+            st.markdown(
+                "| Роль | Логін | Пароль |\n"
+                "|---|---|---|\n"
+                "| Адміністратор | `admin` | `admin123` |\n"
+                "| Журі | `jury_demo` | `jury123` |\n"
+                "| Ментор | `mentor_demo` | `mentor123` |\n"
+                "| Учасник | `participant_demo` | `part123` |"
+            )
 
     with tab2:
         st.write(f"Реєстрація доступна для студентів **{MAIN_UNIVERSITY}**, {MAIN_FACULTY}, а також партнерських закладів.")
