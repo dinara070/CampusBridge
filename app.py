@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-CampusBridge — платформа студентських челенджів та хакатонів
-Один файл, Python + Streamlit + SQLite.
-
-Запуск:
-    pip install streamlit pandas openpyxl
-    streamlit run campusbridge.py
-
-Дефолтний адмін: логін "admin", пароль "admin123"
-"""
-
 import streamlit as st
 import sqlite3
 import pandas as pd
