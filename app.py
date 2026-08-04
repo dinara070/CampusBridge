@@ -21,12 +21,19 @@ import random
 import string
 import statistics
 import uuid
+import os
 
 try:
     from streamlit_calendar import calendar as st_calendar
     CALENDAR_AVAILABLE = True
 except ImportError:
     CALENDAR_AVAILABLE = False
+
+try:
+    import reportlab  # noqa: F401
+    PDF_LIB_AVAILABLE = True
+except ImportError:
+    PDF_LIB_AVAILABLE = False
 
 # ============================================================
 # КОНСТАНТИ
@@ -431,6 +438,161 @@ def youtube_embed_url(url):
     return url.strip() if url else None
 
 
+UA_TRANSLIT = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g', 'д': 'd', 'е': 'e', 'є': 'ye',
+    'ж': 'zh', 'з': 'z', 'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y', 'к': 'k', 'л': 'l',
+    'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ь': '',
+    'ю': 'yu', 'я': 'ya', "'": '',
+    'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'H', 'Ґ': 'G', 'Д': 'D', 'Е': 'E', 'Є': 'Ye',
+    'Ж': 'Zh', 'З': 'Z', 'И': 'Y', 'І': 'I', 'Ї': 'Yi', 'Й': 'Y', 'К': 'K', 'Л': 'L',
+    'М': 'M', 'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
+    'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Shch', 'Ь': '',
+    'Ю': 'Yu', 'Я': 'Ya',
+}
+
+
+def transliterate_ua(text):
+    """Резервна транслітерація кирилиці латиницею для PDF, якщо на сервері немає шрифту з кирилицею."""
+    if not text:
+        return ""
+    return "".join(UA_TRANSLIT.get(ch, ch) for ch in str(text))
+
+
+_PDF_CYRILLIC_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+]
+_PDF_CYRILLIC_BOLD_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+]
+
+
+def _register_pdf_fonts():
+    """Реєструє TTF-шрифт з підтримкою кирилиці для reportlab, якщо він є на сервері."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    regular_path = next((p for p in _PDF_CYRILLIC_FONT_CANDIDATES if os.path.exists(p)), None)
+    if not regular_path:
+        return None, None
+    bold_path = next((p for p in _PDF_CYRILLIC_BOLD_CANDIDATES if os.path.exists(p)), regular_path)
+    try:
+        pdfmetrics.registerFont(TTFont("CBSans", regular_path))
+        pdfmetrics.registerFont(TTFont("CBSans-Bold", bold_path))
+        return "CBSans", "CBSans-Bold"
+    except Exception:
+        return None, None
+
+
+def generate_jury_protocol_pdf(event_id):
+    """Формує офіційний протокол засідання журі у форматі PDF."""
+    if not PDF_LIB_AVAILABLE:
+        return None
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+
+    ev = query_one("SELECT title, university, faculty, event_start FROM events WHERE id=?", (event_id,))
+    if not ev:
+        return None
+    ev_title, university, faculty, event_start = ev
+
+    teams = query_df("SELECT * FROM teams WHERE event_id=? AND status='Прийнято'", (event_id,))
+    criteria = query_df("SELECT * FROM criteria WHERE event_id=?", (event_id,))
+    jury_list = query_df("""SELECT DISTINCT u.full_name FROM jury_assignments ja
+                             JOIN users u ON ja.jury_id = u.id WHERE ja.event_id=?""", (event_id,))
+    if teams.empty or criteria.empty:
+        return None
+
+    font_regular, font_bold = _register_pdf_fonts()
+    use_translit = font_regular is None
+    font_regular = font_regular or "Helvetica"
+    font_bold = font_bold or "Helvetica-Bold"
+
+    def T(text):
+        return transliterate_ua(text) if use_translit else (text or "")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+                             leftMargin=1.5 * cm, rightMargin=1.5 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("CBTitle", parent=styles["Title"], fontName=font_bold,
+                                  alignment=TA_CENTER, fontSize=15)
+    normal_style = ParagraphStyle("CBNormal", parent=styles["Normal"], fontName=font_regular, fontSize=10,
+                                   spaceAfter=4)
+    small_style = ParagraphStyle("CBSmall", parent=styles["Normal"], fontName=font_regular, fontSize=9,
+                                  spaceAfter=10)
+
+    elements = [
+        Paragraph(T(university), normal_style),
+        Paragraph(T(faculty), normal_style),
+        Spacer(1, 10),
+        Paragraph(T("ПРОТОКОЛ засідання журі"), title_style),
+        Spacer(1, 6),
+        Paragraph(T(f"Подія: {ev_title}"), normal_style),
+        Paragraph(T(f"Дата проведення: {event_start or '—'}"), normal_style),
+        Paragraph(T(f"Дата формування протоколу: {now()[:16]}"), normal_style),
+        Spacer(1, 14),
+    ]
+
+    crit_names = criteria["name"].tolist()
+    header = [T("№"), T("Команда"), T("Факультет")] + [T(cn) for cn in crit_names] + [T("Підсумковий бал")]
+    scored_rows = []
+    for _, t in teams.iterrows():
+        row_scores = []
+        for _, crit in criteria.iterrows():
+            avg_row = query_one("SELECT AVG(score) FROM scores WHERE team_id=? AND criterion_id=?",
+                                 (t["id"], crit["id"]))
+            avg = avg_row[0] if avg_row else None
+            row_scores.append(round(avg, 1) if avg is not None else None)
+        total = compute_team_score(t["id"])
+        scored_rows.append((t, row_scores, total))
+    scored_rows.sort(key=lambda x: x[2] if x[2] is not None else -1, reverse=True)
+
+    table_data = [header]
+    for i, (t, row_scores, total) in enumerate(scored_rows, start=1):
+        table_data.append(
+            [str(i), T(t["name"]), T(t["faculty"])] +
+            [(str(v) if v is not None else "—") for v in row_scores] +
+            [str(total) if total is not None else "—"]
+        )
+
+    tbl = Table(table_data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font_regular),
+        ("FONTNAME", (0, 0), (-1, 0), font_bold),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F8BF9")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FA")]),
+    ]))
+    elements.append(tbl)
+    elements.append(Spacer(1, 24))
+
+    if not jury_list.empty:
+        elements.append(Paragraph(T("Склад журі:"), normal_style))
+        elements.append(Spacer(1, 4))
+        for jname in jury_list["full_name"]:
+            elements.append(Paragraph(T(f"________________________________   {jname}   (підпис)"), small_style))
+        elements.append(Spacer(1, 10))
+
+    elements.append(Paragraph(T("Голова журі: ____________________________   (ПІБ, підпис)"), normal_style))
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph(T("М.П."), normal_style))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 def anon_code(team_id):
     """Детермінований анонімний код команди для сліпого оцінювання."""
     h = hashlib.md5(f"team-anon-{team_id}".encode("utf-8")).hexdigest()[:5].upper()
@@ -598,6 +760,38 @@ def page_calendar():
                 st_calendar(events=cal_events, options=cal_options, key="campusbridge_calendar")
 
 
+def get_score_breakdown(team_id):
+    """Деталізація оцінок команди: кожен критерій і кожен голос журі окремо."""
+    return query_df("""SELECT c.name AS criterion, c.weight, c.max_score,
+                               u.full_name AS jury, s.score, s.feedback
+                        FROM scores s
+                        JOIN criteria c ON s.criterion_id = c.id
+                        JOIN users u ON s.jury_id = u.id
+                        WHERE s.team_id = ?
+                        ORDER BY c.id, u.full_name""", (team_id,))
+
+
+def render_score_breakdown(team_id):
+    df = get_score_breakdown(team_id)
+    if df.empty:
+        st.info("Оцінок ще немає.")
+        return
+    st.markdown("**Середній бал за критеріями (з урахуванням ваги):**")
+    summary = df.groupby(["criterion", "weight", "max_score"], as_index=False)["score"].mean()
+    summary["Внесок у підсумок, %"] = (summary["score"] / summary["max_score"] * summary["weight"]).round(1)
+    summary = summary.rename(columns={"criterion": "Критерій", "weight": "Вага, %",
+                                       "max_score": "Максимум", "score": "Середня оцінка"})
+    summary["Середня оцінка"] = summary["Середня оцінка"].round(2)
+    st.dataframe(summary[["Критерій", "Вага, %", "Максимум", "Середня оцінка", "Внесок у підсумок, %"]],
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("**Оцінки кожного члена журі (з фідбеком):**")
+    detail = df.rename(columns={"criterion": "Критерій", "jury": "Журі", "score": "Оцінка",
+                                 "max_score": "Максимум", "feedback": "Фідбек"})
+    st.dataframe(detail[["Критерій", "Журі", "Оцінка", "Максимум", "Фідбек"]],
+                 use_container_width=True, hide_index=True)
+
+
 def page_leaderboard():
     st.subheader("🏆 Публічна таблиця результатів")
     events = get_events()
@@ -615,34 +809,132 @@ def page_leaderboard():
     if teams.empty:
         st.info("Прийнятих команд поки немає.")
         return
-    rows = []
+
+    ranked = []
     for _, t in teams.iterrows():
         score = compute_team_score(t["id"])
-        rows.append({"Команда": t["name"], "Факультет": t["faculty"], "Бал": score if score is not None else "—"})
-    board = pd.DataFrame(rows)
-    board["_sort"] = board["Бал"].apply(lambda x: x if isinstance(x, (int, float)) else -1)
-    board = board.sort_values("_sort", ascending=False).drop(columns="_sort").reset_index(drop=True)
-    board.index = board.index + 1
-    st.dataframe(board, use_container_width=True)
+        ranked.append((t, score if score is not None else -1, score))
+    ranked.sort(key=lambda x: x[1], reverse=True)
 
-    st.markdown("#### Портфоліо команд")
-    for _, t in teams.iterrows():
-        with st.expander(f"{t['name']} ({t['faculty']})"):
-            sub = query_one("""SELECT repo_link, presentation_link, video_link, description
-                                FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
-            if sub:
-                st.write(sub[3] or "")
-                if sub[0]:
-                    st.write(f"🔗 Репозиторій: {sub[0]}")
-                if sub[2]:
-                    st.write(f"🎬 Відео: {sub[2]}")
+    board_rows = []
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (t, sort_score, score) in enumerate(ranked):
+        place = medals[i] if i < 3 and score is not None else str(i + 1)
+        board_rows.append({"Місце": place, "Команда": t["name"], "Факультет": t["faculty"],
+                            "Бал": score if score is not None else "—"})
+    st.dataframe(pd.DataFrame(board_rows), use_container_width=True, hide_index=True)
+
+    user = st.session_state.user
+    if user and user["role"] in ("admin", "jury"):
+        st.markdown("#### 📄 Офіційний протокол журі")
+        if not PDF_LIB_AVAILABLE:
+            st.caption("Для експорту в PDF на сервері потрібен пакет `reportlab` (додайте його в requirements.txt).")
+        else:
+            pdf_bytes = generate_jury_protocol_pdf(ev_id)
+            if pdf_bytes:
+                st.download_button(
+                    "📄 Завантажити офіційний протокол журі (PDF)",
+                    data=pdf_bytes,
+                    file_name=f"protocol_{ev_id}.pdf",
+                    mime="application/pdf",
+                )
             else:
-                st.write("Подача ще не завантажена.")
+                st.caption("Ще недостатньо даних для формування протоколу (немає критеріїв або команд).")
+
+    st.markdown("#### Портфоліо та деталізація оцінок команд")
+    for i, (t, sort_score, score) in enumerate(ranked):
+        place_label = f"{medals[i]} " if i < 3 and score is not None else ""
+        with st.expander(f"{place_label}{t['name']} ({t['faculty']}) — {score if score is not None else '—'} балів"):
+            tab_portfolio, tab_breakdown = st.tabs(["📦 Портфоліо проєкту", "🔍 Деталізація балу"])
+            with tab_portfolio:
+                sub = query_one("""SELECT repo_link, presentation_link, video_link, description
+                                    FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
+                if sub:
+                    st.write(sub[3] or "")
+                    if sub[0]:
+                        st.write(f"🔗 Репозиторій: {sub[0]}")
+                    if sub[2]:
+                        st.video(youtube_embed_url(sub[2]))
+                else:
+                    st.write("Подача ще не завантажена.")
+            with tab_breakdown:
+                render_score_breakdown(t["id"])
 
 
 # ============================================================
 # ЛОГІН / РЕЄСТРАЦІЯ
 # ============================================================
+
+def page_showcase():
+    st.subheader("🖼️ Портфоліо проєктів (Showcase)")
+    st.caption("Галерея найкращих студентських проєктів: репозиторії, демо-відео та презентації "
+               "з поточних і минулих подій.")
+
+    only_archived = st.checkbox("Показувати лише завершені події (архів)", value=True)
+    search_q = st.text_input("🔎 Пошук за назвою команди або описом проєкту")
+
+    events = get_events("Архів") if only_archived else get_events()
+    if events.empty:
+        st.info("Завершених подій ще немає. Зніміть позначку вище, щоб побачити проєкти поточних подій.")
+        return
+
+    found_any = False
+    for _, ev in events.iterrows():
+        teams = query_df("SELECT * FROM teams WHERE event_id=? AND status='Прийнято'", (ev["id"],))
+        if teams.empty:
+            continue
+
+        scored = []
+        for _, t in teams.iterrows():
+            sub = query_one("""SELECT repo_link, presentation_link, video_link, description
+                                FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
+            if not sub:
+                continue
+            desc = sub[3] or ""
+            if search_q.strip():
+                q = search_q.strip().lower()
+                if q not in t["name"].lower() and q not in desc.lower():
+                    continue
+            scored.append((t, sub, compute_team_score(t["id"])))
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: x[2] if x[2] is not None else -1, reverse=True)
+        found_any = True
+        st.markdown(f"### {ev['title']}")
+        st.caption(f"{ev['category']} · {ev['format']} · {ev['event_start'] or 'дата не вказана'}")
+
+        cols = st.columns(2)
+        for idx, (t, sub, score) in enumerate(scored):
+            with cols[idx % 2]:
+                with st.container(border=True):
+                    badge = " 🏆" if idx == 0 and score is not None else ""
+                    st.markdown(f"**{t['name']}**{badge}")
+                    st.caption(f"{t['faculty']}" + (f" · ⭐ {score} балів" if score is not None else ""))
+                    if sub[3]:
+                        preview = sub[3][:220] + ("…" if len(sub[3]) > 220 else "")
+                        st.write(preview)
+                    if sub[2]:
+                        st.video(youtube_embed_url(sub[2]))
+                    if sub[0]:
+                        st.write(f"🔗 [Репозиторій проєкту]({sub[0]})")
+                    files = query_df("""SELECT f.id, f.filename FROM files f
+                                         JOIN submissions s ON f.submission_id = s.id
+                                         WHERE s.team_id=? ORDER BY f.uploaded_at DESC LIMIT 1""", (t["id"],))
+                    if not files.empty:
+                        file_id = int(files.iloc[0]["id"])
+                        file_name = files.iloc[0]["filename"]
+                        blob_row = query_one("SELECT data, mimetype FROM files WHERE id=?", (file_id,))
+                        if blob_row:
+                            st.download_button(f"📄 Завантажити презентацію ({file_name})",
+                                                data=blob_row[0], file_name=file_name,
+                                                mime=blob_row[1] or "application/pdf",
+                                                key=f"showcase_file_{t['id']}")
+        st.markdown("---")
+
+    if not found_any:
+        st.info("За обраними фільтрами проєктів не знайдено.")
+
 
 def page_login():
     tab1, tab2 = st.tabs(["Вхід", "Реєстрація учасника"])
@@ -1140,7 +1432,7 @@ def page_admin():
     st.sidebar.markdown("### 👑 Меню адміністратора")
     menu = st.sidebar.radio("Розділ", [
         "🛠️ Конструктор подій", "📥 Модерація заявок", "⚖️ Журі", "🧑‍🏫 Ментори",
-        "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд"
+        "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд", "🖼️ Портфоліо проєктів"
     ])
     if menu == "🛠️ Конструктор подій":
         admin_event_builder()
@@ -1158,6 +1450,8 @@ def page_admin():
         admin_import_export()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
+    elif menu == "🖼️ Портфоліо проєктів":
+        page_showcase()
 
 
 # ============================================================
@@ -1332,7 +1626,7 @@ def participant_office_hours():
 def page_participant():
     st.sidebar.markdown("### 🎓 Меню учасника")
     menu = st.sidebar.radio("Розділ", ["📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
-                                        "🏆 Лідерборд", "📢 Оголошення"])
+                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
     if menu == "📅 Календар подій":
         page_calendar()
     elif menu == "🚀 Моя команда":
@@ -1341,6 +1635,8 @@ def page_participant():
         participant_office_hours()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
+    elif menu == "🖼️ Портфоліо проєктів":
+        page_showcase()
     elif menu == "📢 Оголошення":
         page_announcements_view()
 
@@ -1373,11 +1669,13 @@ def page_announcements_view():
 
 def page_jury():
     st.sidebar.markdown("### ⚖️ Меню журі")
-    menu = st.sidebar.radio("Розділ", ["📋 Оцінювання", "🏆 Лідерборд", "📢 Оголошення"])
+    menu = st.sidebar.radio("Розділ", ["📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
     if menu == "📋 Оцінювання":
         jury_evaluation()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
+    elif menu == "🖼️ Портфоліо проєктів":
+        page_showcase()
     elif menu == "📢 Оголошення":
         page_announcements_view()
 
@@ -1475,11 +1773,13 @@ def jury_evaluation():
 
 def page_mentor():
     st.sidebar.markdown("### 🧑‍🏫 Меню ментора")
-    menu = st.sidebar.radio("Розділ", ["🗓️ Мої слоти консультацій", "🏆 Лідерборд", "📢 Оголошення"])
+    menu = st.sidebar.radio("Розділ", ["🗓️ Мої слоти консультацій", "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
     if menu == "🗓️ Мої слоти консультацій":
         mentor_slots_manager()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
+    elif menu == "🖼️ Портфоліо проєктів":
+        page_showcase()
     elif menu == "📢 Оголошення":
         page_announcements_view()
 
@@ -1551,11 +1851,14 @@ def main():
 
     if user is None:
         st.sidebar.markdown("### Навігація")
-        public_page = st.sidebar.radio("Розділ", ["📅 Календар подій", "🏆 Лідерборд", "🔐 Вхід / Реєстрація"])
+        public_page = st.sidebar.radio("Розділ", ["📅 Календар подій", "🏆 Лідерборд",
+                                                    "🖼️ Портфоліо проєктів", "🔐 Вхід / Реєстрація"])
         if public_page == "📅 Календар подій":
             page_calendar()
         elif public_page == "🏆 Лідерборд":
             page_leaderboard()
+        elif public_page == "🖼️ Портфоліо проєктів":
+            page_showcase()
         else:
             page_login()
         return
