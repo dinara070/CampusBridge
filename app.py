@@ -239,11 +239,71 @@ def init_db():
              "https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
         demo_event_id = c.lastrowid
         c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "AI / Machine Learning"))
+        nom1_id = c.lastrowid
         c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "Web / Mobile розробка"))
+        crit_ids = []
         for crit_name, weight, max_score in [("Інноваційність", 30, 10), ("Технічна реалізація", 40, 10),
                                               ("Презентація", 30, 10)]:
             c.execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
                       (demo_event_id, crit_name, weight, max_score))
+            crit_ids.append(c.lastrowid)
+        conn.commit()
+
+        # демо-команда всередині демо-події — щоб лідерборд і деталізація балів
+        # одразу мали приклад для перегляду, а не порожній екран
+        c.execute("SELECT id FROM users WHERE username='participant_demo'")
+        participant_demo_id = c.fetchone()[0]
+        c.execute("SELECT id FROM users WHERE username='jury_demo'")
+        jury_demo_id = c.fetchone()[0]
+
+        c.execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,faculty,status,
+            status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (demo_event_id, nom1_id, "AI Вінничани", participant_demo_id, gen_code(), MAIN_FACULTY,
+             "Прийнято", "", now()))
+        demo_team_id = c.lastrowid
+        c.execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (demo_team_id, participant_demo_id))
+        c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
+            version,updated_at) VALUES (?,?,?,?,?,?,?)""",
+            (demo_team_id, "https://github.com/campusbridge/demo-ai-assistant", "",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+             "Демонстраційний проєкт: інтелектуальний асистент, що підбирає студентам хакатони "
+             "та челенджі за їхніми навичками й інтересами.", 1, now()))
+        for cid in crit_ids:
+            c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
+                VALUES (?,?,?,?,?,?)""",
+                (demo_team_id, jury_demo_id, cid, 8.0,
+                 "Сильна ідея та якісна технічна реалізація, продовжуйте розвивати проєкт!", now()))
+
+        # архівна подія минулого року — щоб публічне портфоліо (Showcase) теж не було порожнім
+        c.execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
+            event_start,pitch_deadline,min_team,max_team,prize_fund,status,leaderboard_live,avoid_conflict,
+            university,faculty,created_by,created_at,double_blind,banner_url,video_url)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("CampusBridge Hack 2025", "IT", "Офлайн",
+             "Архівна подія минулого року — приклад завершеного хакатону з опублікованим портфоліо проєктів.",
+             "", "2025-09-01", "2025-09-15", "2025-09-20", "2025-09-21", 2, 5, "30 000 грн",
+             "Архів", 1, 1, MAIN_UNIVERSITY, MAIN_FACULTY, admin_id, now(), 0,
+             "https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?w=800", ""))
+        archive_event_id = c.lastrowid
+        archive_crit_ids = []
+        for crit_name, weight, max_score in [("Інноваційність", 30, 10), ("Технічна реалізація", 40, 10),
+                                              ("Презентація", 30, 10)]:
+            c.execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
+                      (archive_event_id, crit_name, weight, max_score))
+            archive_crit_ids.append(c.lastrowid)
+        c.execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,faculty,status,
+            status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (archive_event_id, None, "Смарт Кампус", None, gen_code(), MAIN_FACULTY, "Прийнято", "", now()))
+        archive_team_id = c.lastrowid
+        c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
+            version,updated_at) VALUES (?,?,?,?,?,?,?)""",
+            (archive_team_id, "https://github.com/campusbridge/smart-campus", "", "",
+             "Переможець хакатону 2025 року: система розумного кампусу з керуванням аудиторіями "
+             "та розкладом у реальному часі.", 1, now()))
+        for cid in archive_crit_ids:
+            c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
+                VALUES (?,?,?,?,?,?)""", (archive_team_id, jury_demo_id, cid, 9.0, "Відмінна робота!", now()))
+
         conn.commit()
 
     conn.close()
