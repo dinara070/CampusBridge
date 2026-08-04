@@ -211,6 +211,34 @@ def init_db():
                          VALUES (?,?,?,?,?,?,?,?)""",
                       (username, hash_pw(pw), role, full_name, email, MAIN_UNIVERSITY, faculty, now()))
     conn.commit()
+
+    # демо-подія, щоб календар і лідерборд не виглядали порожніми "з коробки"
+    c.execute("SELECT COUNT(*) FROM events")
+    if c.fetchone()[0] == 0:
+        c.execute("SELECT id FROM users WHERE username='admin'")
+        admin_id = c.fetchone()[0]
+        c.execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
+            event_start,pitch_deadline,min_team,max_team,prize_fund,status,leaderboard_live,avoid_conflict,
+            university,faculty,created_by,created_at,double_blind,banner_url,video_url)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("CampusBridge Demo Hack 2026", "IT", "Гібридний",
+             "Демонстраційний хакатон для тестування платформи CampusBridge: подача проєктів, "
+             "оцінювання журі, office hours з менторами та лідерборд у реальному часі.",
+             "Регламент: команди 2-5 осіб, дедлайн подачі — 20.09.2026, фінальний пітчинг — 25.09.2026.",
+             "2026-09-01", "2026-09-20", "2026-09-22", "2026-09-25",
+             2, 5, "50 000 грн", "Реєстрація відкрита", 1, 1,
+             MAIN_UNIVERSITY, MAIN_FACULTY, admin_id, now(), 0,
+             "https://images.unsplash.com/photo-1504384308090-c894fdcc538d?w=800",
+             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        demo_event_id = c.lastrowid
+        c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "AI / Machine Learning"))
+        c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "Web / Mobile розробка"))
+        for crit_name, weight, max_score in [("Інноваційність", 30, 10), ("Технічна реалізація", 40, 10),
+                                              ("Презентація", 30, 10)]:
+            c.execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
+                      (demo_event_id, crit_name, weight, max_score))
+        conn.commit()
+
     conn.close()
 
 
