@@ -22,6 +22,8 @@ import string
 import statistics
 import uuid
 import base64
+import smtplib
+from email.mime.text import MIMEText
 import altair as alt
 import os
 
@@ -234,6 +236,17 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_id INTEGER, voter_key TEXT, created_at TEXT,
         UNIQUE(team_id, voter_key)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS team_status_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, old_status TEXT, new_status TEXT,
+        changed_by_id INTEGER, changed_by_name TEXT,
+        comment TEXT, changed_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS email_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, to_email TEXT, subject TEXT, body TEXT,
+        status TEXT, created_at TEXT
     )""")
     conn.commit()
 
@@ -765,6 +778,142 @@ def maybe_autoclose_registration(event_id):
         execute("UPDATE events SET status='Закрито' WHERE id=?", (event_id,))
         return True
     return False
+
+
+# ------------------------------------------------------------
+# Модерація заявок: унікальність учасників, історія статусів, email
+# ------------------------------------------------------------
+
+def get_user_team_for_event(user_id, event_id):
+    """Повертає (team_id, team_name), якщо користувач уже в якійсь команді на цю подію, інакше None."""
+    row = query_one("""SELECT t.id, t.name FROM team_members tm JOIN teams t ON tm.team_id = t.id
+                        WHERE tm.user_id=? AND t.event_id=?""", (user_id, event_id))
+    return row
+
+
+def find_duplicate_participants(event_id):
+    """Знаходить учасників, які одночасно записані у 2+ команди на цю саму подію."""
+    df = query_df("""SELECT u.id AS user_id, u.full_name, u.email, t.id AS team_id, t.name AS team_name
+                      FROM team_members tm
+                      JOIN users u ON tm.user_id = u.id
+                      JOIN teams t ON tm.team_id = t.id
+                      WHERE t.event_id = ?
+                      ORDER BY u.id""", (event_id,))
+    if df.empty:
+        return df
+    dupes = df[df.duplicated(subset=["user_id"], keep=False)]
+    return dupes
+
+
+def log_status_change(team_id, old_status, new_status, comment):
+    """Логує зміну статусу заявки команди: хто, коли, з якого статусу на який, з яким коментарем."""
+    if old_status == new_status:
+        return
+    user = st.session_state.get("user") or {}
+    execute("""INSERT INTO team_status_log (team_id,old_status,new_status,changed_by_id,changed_by_name,
+               comment,changed_at) VALUES (?,?,?,?,?,?,?)""",
+            (team_id, old_status, new_status, user.get("id"), user.get("full_name", "Система"), comment, now()))
+
+
+def get_status_history(team_id):
+    return query_df("""SELECT changed_at, old_status, new_status, changed_by_name, comment
+                        FROM team_status_log WHERE team_id=? ORDER BY changed_at DESC""", (team_id,))
+
+
+def get_smtp_config():
+    """Читає налаштування SMTP із .streamlit/secrets.toml (секція [smtp]), якщо вони є."""
+    try:
+        if hasattr(st, "secrets") and "smtp" in st.secrets:
+            return dict(st.secrets["smtp"])
+    except Exception:
+        pass
+    return None
+
+
+EMAIL_TEMPLATES_BY_STATUS = {
+    "Прийнято": {
+        "subject": "✅ Заявку команди «{team}» прийнято — {event}",
+        "intro": "Вітаємо! Заявку вашої команди на подію «{event}» ПРИЙНЯТО.",
+    },
+    "Потребує доопрацювання": {
+        "subject": "⚠️ Заявка команди «{team}» потребує доопрацювання — {event}",
+        "intro": "Заявку вашої команди на подію «{event}» відправлено на доопрацювання.",
+    },
+}
+
+
+def send_status_email(team_id, new_status, comment):
+    """Надсилає (або симулює) email-сповіщення капітану команди при зміні статусу.
+    Повертає 'sent' / 'simulated' / 'failed: ...' / None (якщо надсилання не потрібне)."""
+    tmpl = EMAIL_TEMPLATES_BY_STATUS.get(new_status)
+    if not tmpl:
+        return None
+
+    team = query_one("""SELECT t.name, t.captain_id, e.title FROM teams t
+                         JOIN events e ON t.event_id = e.id WHERE t.id=?""", (team_id,))
+    if not team:
+        return None
+    team_name, captain_id, event_title = team
+    if not captain_id:
+        return None  # команда без капітана (наприклад, імпортована вручну) — надсилати нікому
+
+    captain = query_one("SELECT full_name, email FROM users WHERE id=?", (captain_id,))
+    if not captain or not captain[1]:
+        return None
+    captain_name, to_email = captain
+
+    subject = tmpl["subject"].format(team=team_name, event=event_title)
+    body_lines = [f"Вітаємо, {captain_name}!", "", tmpl["intro"].format(event=event_title)]
+    if comment:
+        body_lines += ["", f"Коментар організаторів: {comment}"]
+    body_lines += ["", "Деталі можна переглянути в особистому кабінеті на платформі CampusBridge.",
+                   "", f"— CampusBridge, {MAIN_UNIVERSITY}"]
+    body = "\n".join(body_lines)
+
+    status_result = "simulated"
+    smtp_cfg = get_smtp_config()
+    if smtp_cfg:
+        try:
+            msg = MIMEText(body, _charset="utf-8")
+            msg["Subject"] = subject
+            from_email = smtp_cfg.get("from_email") or smtp_cfg.get("username", "")
+            msg["From"] = from_email
+            msg["To"] = to_email
+            host = smtp_cfg["host"]
+            port = int(smtp_cfg.get("port", 587))
+            use_tls = bool(smtp_cfg.get("use_tls", True))
+            with smtplib.SMTP(host, port, timeout=10) as server:
+                if use_tls:
+                    server.starttls()
+                if smtp_cfg.get("username"):
+                    server.login(smtp_cfg["username"], smtp_cfg.get("password", ""))
+                server.sendmail(from_email, [to_email], msg.as_string())
+            status_result = "sent"
+        except Exception as e:
+            status_result = f"failed: {e}"
+
+    execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+               VALUES (?,?,?,?,?,?)""", (team_id, to_email, subject, body, status_result, now()))
+    return status_result
+
+
+def apply_team_status_change(team_id, new_status, comment):
+    """Єдина точка зміни статусу команди: оновлює запис, логує історію й надсилає email.
+    Повертає (old_status, email_result)."""
+    old_row = query_one("SELECT status FROM teams WHERE id=?", (team_id,))
+    old_status = old_row[0] if old_row else None
+    execute("UPDATE teams SET status=?, status_comment=? WHERE id=?", (new_status, comment, team_id))
+    log_status_change(team_id, old_status, new_status, comment)
+    email_result = None
+    if old_status != new_status:
+        email_result = send_status_email(team_id, new_status, comment)
+    return old_status, email_result
+
+
+def get_email_log_for_event(event_id):
+    return query_df("""SELECT el.created_at, t.name AS team, el.to_email, el.subject, el.status
+                        FROM email_log el JOIN teams t ON el.team_id = t.id
+                        WHERE t.event_id=? ORDER BY el.created_at DESC""", (event_id,))
 
 
 # ------------------------------------------------------------
@@ -1693,37 +1842,105 @@ def admin_team_moderation():
         st.info("Заявок ще немає.")
         return
 
-    status_filter = st.multiselect("Фільтр за статусом", TEAM_STATUSES, default=TEAM_STATUSES)
-    teams = teams[teams["status"].isin(status_filter)]
+    # --- перевірка унікальності та складу: дублювання учасників між командами ---
+    dupes = find_duplicate_participants(ev_id)
+    if not dupes.empty:
+        with st.container(border=True):
+            st.error(f"⚠️ Виявлено {dupes['user_id'].nunique()} учасник(ів), зареєстрованих одразу "
+                     "у кількох командах на цю подію (можливе дублювання):")
+            st.dataframe(
+                dupes.rename(columns={"full_name": "ПІБ", "email": "Пошта",
+                                       "team_name": "Команда", "team_id": "ID команди"})
+                     [["ПІБ", "Пошта", "Команда", "ID команди"]],
+                use_container_width=True, hide_index=True)
+            st.caption("Рекомендується зв'язатися з учасником і залишити його лише в одній команді "
+                       "перед підтвердженням заявок.")
+    else:
+        st.caption("✅ Перевірка унікальності: дублювання учасників між командами на цю подію не виявлено.")
 
-    st.dataframe(teams[["id", "name", "faculty", "status", "status_comment"]],
+    status_filter = st.multiselect("Фільтр за статусом", TEAM_STATUSES, default=TEAM_STATUSES)
+    teams_view = teams[teams["status"].isin(status_filter)]
+
+    st.dataframe(teams_view[["id", "name", "faculty", "status", "status_comment"]],
                  use_container_width=True, hide_index=True)
 
     st.markdown("#### Масові дії")
-    ids = st.multiselect("Оберіть ID команд", teams["id"].tolist())
+    st.caption("При переведенні у статус «Прийнято» або «Потребує доопрацювання» капітанам команд "
+               "автоматично надсилається email-сповіщення (або симулюється, якщо SMTP не налаштовано).")
+    ids = st.multiselect("Оберіть ID команд", teams_view["id"].tolist())
     bulk_status = st.selectbox("Новий статус", TEAM_STATUSES, key="bulk_status")
     bulk_comment = st.text_input("Коментар (за потреби, наприклад причина доопрацювання)")
     if st.button("Застосувати до обраних") and ids:
+        email_results = []
         for tid in ids:
-            execute("UPDATE teams SET status=?, status_comment=? WHERE id=?", (bulk_status, bulk_comment, tid))
+            _, email_result = apply_team_status_change(int(tid), bulk_status, bulk_comment)
+            if email_result:
+                email_results.append(email_result)
         st.success(f"Оновлено {len(ids)} команд(и).")
+        if email_results:
+            sent = sum(1 for r in email_results if r == "sent")
+            simulated = sum(1 for r in email_results if r == "simulated")
+            failed = sum(1 for r in email_results if r.startswith("failed"))
+            msg = []
+            if sent:
+                msg.append(f"✅ реально надіслано: {sent}")
+            if simulated:
+                msg.append(f"📧 симульовано (SMTP не налаштовано): {simulated}")
+            if failed:
+                msg.append(f"❌ помилок надсилання: {failed}")
+            st.info(" · ".join(msg))
         st.rerun()
 
     st.markdown("#### Індивідуальна зміна статусу")
-    for _, t in teams.iterrows():
+    for _, t in teams_view.iterrows():
         with st.expander(f"#{t['id']} · {t['name']} — {t['status']}"):
             members = query_df("""SELECT u.full_name, u.email FROM team_members tm
                                    JOIN users u ON tm.user_id=u.id WHERE tm.team_id=?""", (t["id"],))
             st.write("**Учасники:**")
             st.dataframe(members, use_container_width=True, hide_index=True)
+
             new_status = st.selectbox("Статус", TEAM_STATUSES,
                                        index=TEAM_STATUSES.index(t["status"]) if t["status"] in TEAM_STATUSES else 0,
                                        key=f"st_{t['id']}")
             comment = st.text_input("Коментар для команди", value=t["status_comment"] or "", key=f"cm_{t['id']}")
             if st.button("Зберегти", key=f"save_{t['id']}"):
-                execute("UPDATE teams SET status=?, status_comment=? WHERE id=?", (new_status, comment, t["id"]))
-                st.success("Статус оновлено.")
+                old_status, email_result = apply_team_status_change(int(t["id"]), new_status, comment)
+                st.success(f"Статус оновлено: «{old_status}» → «{new_status}».")
+                if email_result == "sent":
+                    st.info("📧 Email-сповіщення капітану реально надіслано через SMTP.")
+                elif email_result == "simulated":
+                    st.info("📧 Email-сповіщення симульовано (SMTP не налаштовано в secrets.toml) — "
+                            "лист збережено в журналі нижче.")
+                elif email_result and email_result.startswith("failed"):
+                    st.warning(f"⚠️ Не вдалося надіслати email: {email_result}")
                 st.rerun()
+
+            st.markdown("**🕓 Історія змін статусу**")
+            history = get_status_history(int(t["id"]))
+            if history.empty:
+                st.caption("Змін статусу ще не було.")
+            else:
+                st.dataframe(
+                    history.rename(columns={"changed_at": "Коли", "old_status": "Було",
+                                             "new_status": "Стало", "changed_by_name": "Хто змінив",
+                                             "comment": "Коментар"}),
+                    use_container_width=True, hide_index=True)
+
+    st.markdown("#### 📧 Журнал email-сповіщень")
+    smtp_cfg = get_smtp_config()
+    if smtp_cfg:
+        st.caption(f"SMTP налаштовано ({smtp_cfg.get('host', '?')}) — листи надсилаються реально.")
+    else:
+        st.caption("SMTP не налаштовано в `.streamlit/secrets.toml` ([smtp] host/port/username/password/from_email) — "
+                   "листи симулюються та записуються в журнал нижче, реально не надсилаються.")
+    email_log = get_email_log_for_event(ev_id)
+    if email_log.empty:
+        st.caption("Сповіщень ще не надсилалося.")
+    else:
+        st.dataframe(
+            email_log.rename(columns={"created_at": "Коли", "team": "Команда", "to_email": "Кому",
+                                       "subject": "Тема", "status": "Статус"}),
+            use_container_width=True, hide_index=True)
 
 
 def admin_jury():
@@ -2059,10 +2276,14 @@ def participant_my_team():
                 team_name = st.text_input("Назва команди")
                 faculty = st.text_input("Факультет", value=user.get("faculty") or MAIN_FACULTY)
                 if st.form_submit_button("Створити команду") and team_name:
-                    # перевірка ліміту безпосередньо перед записом (захист від перегонів)
+                    # перевірка унікальності: чи не в іншій команді на цю ж подію вже цей учасник
+                    dup = get_user_team_for_event(user["id"], ev_id)
                     ev_check = query_one("SELECT max_teams, status FROM events WHERE id=?", (ev_id,))
                     current_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev_id,))[0]
-                    if ev_check and ev_check[1] != "Реєстрація відкрита":
+                    if dup:
+                        st.error(f"Ви вже зареєстровані в команді «{dup[1]}» на цю подію. "
+                                 "Участь в кількох командах на одну й ту саму подію заборонена.")
+                    elif ev_check and ev_check[1] != "Реєстрація відкрита":
                         st.error("На жаль, реєстрацію на цю подію щойно закрито. Оберіть іншу подію.")
                     elif ev_check and ev_check[0] and current_count >= ev_check[0]:
                         execute("UPDATE events SET status='Закрито' WHERE id=?", (ev_id,))
@@ -2089,8 +2310,12 @@ def participant_my_team():
                 else:
                     tid, ev_id = team
                     already = query_one("SELECT id FROM team_members WHERE team_id=? AND user_id=?", (tid, user["id"]))
+                    dup = get_user_team_for_event(user["id"], ev_id)
                     if already:
                         st.warning("Ви вже у цій команді.")
+                    elif dup:
+                        st.error(f"Ви вже зареєстровані в команді «{dup[1]}» на цю подію. "
+                                 "Спочатку вийдіть з поточної команди, щоб приєднатись до іншої.")
                     else:
                         ev = query_one("SELECT max_team FROM events WHERE id=?", (ev_id,))
                         current_count = query_one("SELECT COUNT(*) FROM team_members WHERE team_id=?", (tid,))[0]
