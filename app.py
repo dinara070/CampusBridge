@@ -21,6 +21,8 @@ import random
 import string
 import statistics
 import uuid
+import base64
+import altair as alt
 import os
 
 try:
@@ -93,6 +95,20 @@ st.set_page_config(page_title="CampusBridge", page_icon="🎓", layout="wide")
 # ============================================================
 # ШАР ДОСТУПУ ДО БАЗИ ДАНИХ
 # ============================================================
+
+# pandas/numpy повертають numpy.int64/float64 для колонок id при ітерації DataFrame
+# (наприклад, у циклах по критеріях/командах у лідерборді). Без цих адаптерів sqlite3
+# мовчки не знаходить збігів по такому параметру (повертає None замість помилки),
+# тому реєструємо конвертацію у звичайні Python int/float ще до першого запиту.
+try:
+    import numpy as _np
+    for _int_type in (_np.int64, _np.int32, _np.intp):
+        sqlite3.register_adapter(_int_type, lambda val: int(val))
+    for _float_type in (_np.float64, _np.float32):
+        sqlite3.register_adapter(_float_type, lambda val: float(val))
+except ImportError:
+    pass
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -214,6 +230,11 @@ def init_db():
         location TEXT, is_booked INTEGER DEFAULT 0,
         team_id INTEGER, notes TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS showcase_likes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, voter_key TEXT, created_at TEXT,
+        UNIQUE(team_id, voter_key)
+    )""")
     conn.commit()
 
     # м'які міграції: додаємо нові колонки, якщо їх ще немає
@@ -229,6 +250,12 @@ def init_db():
         c.execute("ALTER TABLE events ADD COLUMN max_teams INTEGER")
     if "jury_see_other_scores" not in existing_cols:
         c.execute("ALTER TABLE events ADD COLUMN jury_see_other_scores INTEGER DEFAULT 0")
+    conn.commit()
+
+    c.execute("PRAGMA table_info(submissions)")
+    sub_cols = [row[1] for row in c.fetchall()]
+    if "tags" not in sub_cols:
+        c.execute("ALTER TABLE submissions ADD COLUMN tags TEXT")
     conn.commit()
 
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
@@ -279,6 +306,7 @@ def init_db():
         c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "AI / Machine Learning"))
         nom1_id = c.lastrowid
         c.execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (demo_event_id, "Web / Mobile розробка"))
+        nom2_id = c.lastrowid
         crit_ids = []
         for crit_name, weight, max_score in [("Інноваційність", 30, 10), ("Технічна реалізація", 40, 10),
                                               ("Презентація", 30, 10)]:
@@ -301,16 +329,33 @@ def init_db():
         demo_team_id = c.lastrowid
         c.execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (demo_team_id, participant_demo_id))
         c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
-            version,updated_at) VALUES (?,?,?,?,?,?,?)""",
+            version,updated_at,tags) VALUES (?,?,?,?,?,?,?,?)""",
             (demo_team_id, "https://github.com/campusbridge/demo-ai-assistant", "",
              "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
              "Демонстраційний проєкт: інтелектуальний асистент, що підбирає студентам хакатони "
-             "та челенджі за їхніми навичками й інтересами.", 1, now()))
+             "та челенджі за їхніми навичками й інтересами.", 1, now(),
+             "Python, Machine Learning, NLP, FastAPI"))
         for cid in crit_ids:
             c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
                 VALUES (?,?,?,?,?,?)""",
                 (demo_team_id, jury_demo_id, cid, 8.0,
                  "Сильна ідея та якісна технічна реалізація, продовжуйте розвивати проєкт!", now()))
+
+        # друга демо-команда в іншій номінації — щоб фільтр за номінаціями та порівняння команд
+        # у лідерборді одразу мали що показати
+        c.execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,faculty,status,
+            status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (demo_event_id, nom2_id, "Web Titans", None, gen_code(), "ФІТ", "Прийнято", "", now()))
+        demo_team2_id = c.lastrowid
+        c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
+            version,updated_at,tags) VALUES (?,?,?,?,?,?,?,?)""",
+            (demo_team2_id, "https://github.com/campusbridge/demo-web-titans", "", "",
+             "Демонстраційний проєкт: платформа для обміну конспектами між студентами факультету.",
+             1, now(), "React, TypeScript, Node.js, PostgreSQL"))
+        for cid, sc in zip(crit_ids, [6.0, 7.0, 6.5]):
+            c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
+                VALUES (?,?,?,?,?,?)""",
+                (demo_team2_id, jury_demo_id, cid, sc, "Непогана реалізація, варто доопрацювати UX.", now()))
 
         # архівна подія минулого року — щоб публічне портфоліо (Showcase) теж не було порожнім
         c.execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
@@ -334,10 +379,10 @@ def init_db():
             (archive_event_id, None, "Смарт Кампус", None, gen_code(), MAIN_FACULTY, "Прийнято", "", now()))
         archive_team_id = c.lastrowid
         c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
-            version,updated_at) VALUES (?,?,?,?,?,?,?)""",
+            version,updated_at,tags) VALUES (?,?,?,?,?,?,?,?)""",
             (archive_team_id, "https://github.com/campusbridge/smart-campus", "", "",
              "Переможець хакатону 2025 року: система розумного кампусу з керуванням аудиторіями "
-             "та розкладом у реальному часі.", 1, now()))
+             "та розкладом у реальному часі.", 1, now(), "IoT, React, Node.js, MQTT"))
         for cid in archive_crit_ids:
             c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
                 VALUES (?,?,?,?,?,?)""", (archive_team_id, jury_demo_id, cid, 9.0, "Відмінна робота!", now()))
@@ -722,6 +767,136 @@ def maybe_autoclose_registration(event_id):
     return False
 
 
+# ------------------------------------------------------------
+# Лайки глядачів (Community Choice Award) для портфоліо
+# ------------------------------------------------------------
+
+def get_voter_key():
+    """Повертає стабільний ідентифікатор голосуючого: користувача або анонімної сесії."""
+    user = st.session_state.get("user")
+    if user:
+        return f"user:{user['id']}"
+    if "_anon_voter_id" not in st.session_state:
+        st.session_state["_anon_voter_id"] = f"anon:{uuid.uuid4()}"
+    return st.session_state["_anon_voter_id"]
+
+
+def has_liked(team_id):
+    return query_one("SELECT id FROM showcase_likes WHERE team_id=? AND voter_key=?",
+                      (team_id, get_voter_key())) is not None
+
+
+def get_like_count(team_id):
+    return query_one("SELECT COUNT(*) FROM showcase_likes WHERE team_id=?", (team_id,))[0]
+
+
+def toggle_like(team_id):
+    voter = get_voter_key()
+    existing = query_one("SELECT id FROM showcase_likes WHERE team_id=? AND voter_key=?", (team_id, voter))
+    if existing:
+        execute("DELETE FROM showcase_likes WHERE id=?", (existing[0],))
+        return False
+    execute("INSERT INTO showcase_likes (team_id, voter_key, created_at) VALUES (?,?,?)", (team_id, voter, now()))
+    return True
+
+
+def parse_tags(tags_text):
+    if not tags_text:
+        return []
+    return [t.strip() for t in str(tags_text).split(",") if t.strip()]
+
+
+def render_pdf_inline(file_bytes, height=520):
+    """Вбудовує PDF просто в інтерфейс через base64 iframe — без обов'язкового завантаження."""
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    st.markdown(
+        f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" '
+        f'style="border:1px solid #444; border-radius:8px;"></iframe>',
+        unsafe_allow_html=True,
+    )
+
+
+def get_latest_submission_with_file(team_id):
+    """Повертає (submission_row_dict, file_row_dict_or_None) для останньої подачі команди."""
+    sub = query_one("""SELECT id, repo_link, presentation_link, video_link, description, version, tags
+                        FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (team_id,))
+    if not sub:
+        return None, None
+    sub_dict = {"id": sub[0], "repo_link": sub[1], "presentation_link": sub[2], "video_link": sub[3],
+                "description": sub[4], "version": sub[5], "tags": sub[6]}
+    file_row = query_one("""SELECT id, filename, mimetype, data FROM files
+                             WHERE submission_id=? ORDER BY uploaded_at DESC LIMIT 1""", (sub[0],))
+    file_dict = None
+    if file_row:
+        file_dict = {"id": file_row[0], "filename": file_row[1], "mimetype": file_row[2], "data": file_row[3]}
+    return sub_dict, file_dict
+
+
+# ------------------------------------------------------------
+# Медальні картки та аналітика для лідерборду
+# ------------------------------------------------------------
+
+MEDAL_STYLES = {
+    0: {"gradient": "linear-gradient(135deg, #FFD700, #FFA500)", "emoji": "🥇", "label": "1 місце", "glow": "#FFD700"},
+    1: {"gradient": "linear-gradient(135deg, #E8E8E8, #B8B8C0)", "emoji": "🥈", "label": "2 місце", "glow": "#C0C0C0"},
+    2: {"gradient": "linear-gradient(135deg, #CD7F32, #A0522D)", "emoji": "🥉", "label": "3 місце", "glow": "#CD7F32"},
+}
+
+
+def inject_medal_css():
+    st.markdown("""
+        <style>
+        @keyframes medalPulse {
+            0%   { box-shadow: 0 0 0px 0px rgba(255,255,255,0.0); transform: translateY(0px); }
+            50%  { box-shadow: 0 0 24px 4px var(--glow-color); transform: translateY(-3px); }
+            100% { box-shadow: 0 0 0px 0px rgba(255,255,255,0.0); transform: translateY(0px); }
+        }
+        @keyframes medalPop {
+            0%   { opacity: 0; transform: scale(0.85) translateY(10px); }
+            100% { opacity: 1; transform: scale(1) translateY(0); }
+        }
+        .medal-card {
+            border-radius: 16px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            color: #1a1a1a;
+            animation: medalPop 0.5s ease-out, medalPulse 2.6s ease-in-out infinite;
+            animation-delay: 0s, 0.5s;
+        }
+        .medal-card h3 { margin: 0 0 4px 0; font-size: 1.25rem; }
+        .medal-card .medal-emoji { font-size: 1.8rem; margin-right: 8px; }
+        .medal-card .medal-score { font-size: 1.6rem; font-weight: 800; float: right; }
+        .medal-card .medal-sub { opacity: 0.75; font-size: 0.85rem; }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+def render_medal_card(rank_idx, team_name, faculty, score):
+    style = MEDAL_STYLES[rank_idx]
+    st.markdown(
+        f"""<div class="medal-card" style="background:{style['gradient']}; --glow-color:{style['glow']};">
+              <span class="medal-emoji">{style['emoji']}</span><b>{team_name}</b>
+              <span class="medal-score">{score if score is not None else '—'}</span>
+              <div class="medal-sub">{style['label']} · {faculty}</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def build_leaderboard_export(ev_id, ranked_rows, criteria_df):
+    """Формує DataFrame для експорту повної аналітики лідерборду (CSV/Excel)."""
+    rows = []
+    for i, (t, score) in enumerate(ranked_rows):
+        row = {"Місце": i + 1, "Команда": t["name"], "Факультет": t["faculty"]}
+        for _, crit in criteria_df.iterrows():
+            avg = query_one("SELECT AVG(score) FROM scores WHERE team_id=? AND criterion_id=?",
+                             (t["id"], crit["id"]))
+            row[f"{crit['name']} (з {int(crit['max_score'])})"] = round(avg[0], 2) if avg and avg[0] is not None else None
+        row["Підсумковий бал"] = score
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # СТАН СЕСІЇ
 # ============================================================
@@ -929,19 +1104,64 @@ def page_leaderboard():
         st.info("Прийнятих команд поки немає.")
         return
 
+    # --- фільтрація за номінаціями ---
+    noms = query_df("SELECT id, name FROM nominations WHERE event_id=?", (ev_id,))
+    if not noms.empty:
+        nom_options = ["Усі номінації"] + noms["name"].tolist()
+        nom_choice = st.selectbox("🏷️ Номінація", nom_options)
+        if nom_choice != "Усі номінації":
+            chosen_nom_id = int(noms[noms["name"] == nom_choice]["id"].iloc[0])
+            teams = teams[teams["nomination_id"] == chosen_nom_id]
+
+    if teams.empty:
+        st.info("У цій номінації прийнятих команд поки немає.")
+        return
+
+    criteria = query_df("SELECT * FROM criteria WHERE event_id=? ORDER BY id", (ev_id,))
+
     ranked = []
     for _, t in teams.iterrows():
         score = compute_team_score(t["id"])
         ranked.append((t, score if score is not None else -1, score))
     ranked.sort(key=lambda x: x[1], reverse=True)
+    ranked = [(t, score) for t, _, score in ranked]  # (team_row, score)
 
-    board_rows = []
+    # --- анімовані картки призерів (топ-3) ---
+    inject_medal_css()
+    st.markdown("#### 🏅 Призери")
+    podium = ranked[:3]
+    podium_cols = st.columns(len(podium)) if podium else []
+    for i, (t, score) in enumerate(podium):
+        with podium_cols[i]:
+            render_medal_card(i, t["name"], t["faculty"], score)
+
+    # --- повна таблиця ---
+    st.markdown("#### 📋 Повна таблиця результатів")
     medals = ["🥇", "🥈", "🥉"]
-    for i, (t, sort_score, score) in enumerate(ranked):
+    board_rows = []
+    for i, (t, score) in enumerate(ranked):
         place = medals[i] if i < 3 and score is not None else str(i + 1)
         board_rows.append({"Місце": place, "Команда": t["name"], "Факультет": t["faculty"],
                             "Бал": score if score is not None else "—"})
-    st.dataframe(pd.DataFrame(board_rows), use_container_width=True, hide_index=True)
+    board_df = pd.DataFrame(board_rows)
+    st.dataframe(board_df, use_container_width=True, hide_index=True)
+
+    # --- експорт повної аналітики ---
+    st.markdown("#### 📊 Експорт аналітики")
+    export_df = build_leaderboard_export(ev_id, ranked, criteria)
+    ce1, ce2 = st.columns(2)
+    with ce1:
+        csv_buf = io.StringIO()
+        export_df.to_csv(csv_buf, index=False)
+        st.download_button("⬇️ Завантажити аналітику (CSV)", csv_buf.getvalue(),
+                            file_name=f"leaderboard_{ev_id}.csv", mime="text/csv")
+    with ce2:
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="Leaderboard")
+        st.download_button("⬇️ Завантажити аналітику (Excel)", xlsx_buf.getvalue(),
+                            file_name=f"leaderboard_{ev_id}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     user = st.session_state.user
     if user and user["role"] in ("admin", "jury"):
@@ -960,8 +1180,88 @@ def page_leaderboard():
             else:
                 st.caption("Ще недостатньо даних для формування протоколу (немає критеріїв або команд).")
 
+    # --- інтерактивні графіки розподілу балів ---
+    if not criteria.empty:
+        st.markdown("#### 📈 Інтерактивна аналітика балів")
+        tab_totals, tab_criteria, tab_dist = st.tabs(
+            ["Підсумкові бали команд", "Розподіл за критеріями", "Гістограма оцінок"])
+
+        with tab_totals:
+            chart_df = pd.DataFrame([{"Команда": t["name"], "Бал": score if score is not None else 0}
+                                      for t, score in ranked])
+            chart = alt.Chart(chart_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("Команда:N", sort="-y"),
+                y=alt.Y("Бал:Q"),
+                color=alt.Color("Бал:Q", scale=alt.Scale(scheme="goldgreen"), legend=None),
+                tooltip=["Команда", "Бал"],
+            ).properties(height=320)
+            st.altair_chart(chart, use_container_width=True)
+
+        with tab_criteria:
+            rows = []
+            for t, score in ranked:
+                for _, crit in criteria.iterrows():
+                    avg = query_one("SELECT AVG(score) FROM scores WHERE team_id=? AND criterion_id=?",
+                                     (t["id"], crit["id"]))
+                    if avg and avg[0] is not None:
+                        rows.append({"Команда": t["name"], "Критерій": crit["name"], "Середній бал": round(avg[0], 2)})
+            if rows:
+                crit_df = pd.DataFrame(rows)
+                chart2 = alt.Chart(crit_df).mark_bar().encode(
+                    x=alt.X("Команда:N"),
+                    y=alt.Y("Середній бал:Q"),
+                    color=alt.Color("Критерій:N"),
+                    xOffset="Критерій:N",
+                    tooltip=["Команда", "Критерій", "Середній бал"],
+                ).properties(height=340)
+                st.altair_chart(chart2, use_container_width=True)
+            else:
+                st.info("Ще немає оцінок для побудови графіка.")
+
+        with tab_dist:
+            all_scores = query_df("""SELECT s.score, c.name AS criterion FROM scores s
+                                      JOIN criteria c ON s.criterion_id=c.id
+                                      JOIN teams t ON s.team_id=t.id WHERE t.event_id=?""", (ev_id,))
+            if not all_scores.empty:
+                hist = alt.Chart(all_scores).mark_bar().encode(
+                    x=alt.X("score:Q", bin=alt.Bin(maxbins=15), title="Оцінка"),
+                    y=alt.Y("count():Q", title="Кількість оцінок"),
+                    color=alt.Color("criterion:N", title="Критерій"),
+                    tooltip=["criterion", "count()"],
+                ).properties(height=320)
+                st.altair_chart(hist, use_container_width=True)
+            else:
+                st.info("Ще немає індивідуальних оцінок журі для побудови гістограми.")
+
+    # --- порівняння команд між собою ---
+    if len(ranked) >= 2:
+        st.markdown("#### ⚖️ Порівняння команд")
+        team_names = [t["name"] for t, _ in ranked]
+        chosen = st.multiselect("Оберіть 2-4 команди для порівняння", team_names,
+                                 default=team_names[:min(2, len(team_names))])
+        if len(chosen) >= 2:
+            if len(chosen) > 4:
+                st.warning("Для наочності оберіть не більше 4 команд.")
+            else:
+                chosen_teams = [t for t, _ in ranked if t["name"] in chosen]
+                comp_rows = []
+                for _, crit in criteria.iterrows():
+                    row = {"Критерій": f"{crit['name']} (вага {int(crit['weight'])}%)"}
+                    for t in chosen_teams:
+                        avg = query_one("SELECT AVG(score) FROM scores WHERE team_id=? AND criterion_id=?",
+                                         (t["id"], crit["id"]))
+                        row[t["name"]] = round(avg[0], 2) if avg and avg[0] is not None else "—"
+                    comp_rows.append(row)
+                total_row = {"Критерій": "Підсумковий зважений бал"}
+                for t in chosen_teams:
+                    total_row[t["name"]] = compute_team_score(t["id"]) or "—"
+                comp_rows.append(total_row)
+                st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+        elif len(chosen) == 1:
+            st.caption("Оберіть щонайменше 2 команди для порівняння.")
+
     st.markdown("#### Портфоліо та деталізація оцінок команд")
-    for i, (t, sort_score, score) in enumerate(ranked):
+    for i, (t, score) in enumerate(ranked):
         place_label = f"{medals[i]} " if i < 3 and score is not None else ""
         with st.expander(f"{place_label}{t['name']} ({t['faculty']}) — {score if score is not None else '—'} балів"):
             tab_portfolio, tab_breakdown = st.tabs(["📦 Портфоліо проєкту", "🔍 Деталізація балу"])
@@ -984,75 +1284,156 @@ def page_leaderboard():
 # ЛОГІН / РЕЄСТРАЦІЯ
 # ============================================================
 
+@st.dialog("Деталі проєкту", width="large")
+def show_project_detail_dialog(team_id, team_name, event_title, faculty, score):
+    sub, file_row = get_latest_submission_with_file(team_id)
+    st.markdown(f"### {team_name}")
+    st.caption(f"{event_title} · {faculty}" + (f" · ⭐ {score} балів" if score is not None else ""))
+    if sub:
+        tags = parse_tags(sub.get("tags"))
+        if tags:
+            st.markdown(" ".join(f"`{tag}`" for tag in tags))
+        if sub.get("description"):
+            st.write(sub["description"])
+        if sub.get("video_link"):
+            st.video(youtube_embed_url(sub["video_link"]))
+        if sub.get("repo_link"):
+            st.markdown(f"🔗 [Репозиторій проєкту]({sub['repo_link']})")
+        if file_row:
+            st.markdown("**📄 Презентація**")
+            render_pdf_inline(file_row["data"], height=600)
+            st.download_button("⬇️ Завантажити презентацію", data=file_row["data"],
+                                file_name=file_row["filename"], mime=file_row["mimetype"] or "application/pdf",
+                                key=f"dialog_dl_{team_id}")
+    else:
+        st.info("Подача ще не завантажена.")
+
+    st.markdown("---")
+    liked = has_liked(team_id)
+    like_count = get_like_count(team_id)
+    label = f"💔 Прибрати лайк ({like_count})" if liked else f"❤️ Подобається ({like_count})"
+    if st.button(label, key=f"dialog_like_{team_id}"):
+        toggle_like(team_id)
+        st.rerun()
+
+
 def page_showcase():
     st.subheader("🖼️ Портфоліо проєктів (Showcase)")
-    st.caption("Галерея найкращих студентських проєктів: репозиторії, демо-відео та презентації "
-               "з поточних і минулих подій.")
+    st.caption("Галерея студентських проєктів: пошук за технологіями, лайки глядачів (Community Choice Award), "
+               "перегляд презентацій прямо в інтерфейсі — без обов'язкового завантаження.")
 
     only_archived = st.checkbox("Показувати лише завершені події (архів)", value=True)
-    search_q = st.text_input("🔎 Пошук за назвою команди або описом проєкту")
-
     events = get_events("Архів") if only_archived else get_events()
     if events.empty:
         st.info("Завершених подій ще немає. Зніміть позначку вище, щоб побачити проєкти поточних подій.")
         return
 
-    found_any = False
+    # зібрати всі картки одним списком для єдиної галереї
+    items = []
     for _, ev in events.iterrows():
         teams = query_df("SELECT * FROM teams WHERE event_id=? AND status='Прийнято'", (ev["id"],))
-        if teams.empty:
-            continue
-
-        scored = []
         for _, t in teams.iterrows():
-            sub = query_one("""SELECT repo_link, presentation_link, video_link, description
-                                FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
+            sub, file_row = get_latest_submission_with_file(int(t["id"]))
             if not sub:
                 continue
-            desc = sub[3] or ""
-            if search_q.strip():
-                q = search_q.strip().lower()
-                if q not in t["name"].lower() and q not in desc.lower():
-                    continue
-            scored.append((t, sub, compute_team_score(t["id"])))
-        if not scored:
+            items.append({"team": t, "event": ev, "sub": sub, "file": file_row,
+                          "score": compute_team_score(int(t["id"])), "likes": get_like_count(int(t["id"]))})
+
+    if not items:
+        st.info("Проєктів для показу ще немає.")
+        return
+
+    all_tags = sorted({tag for it in items for tag in parse_tags(it["sub"].get("tags"))})
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    with f1:
+        search_q = st.text_input("🔎 Пошук за назвою, описом або технологією")
+    with f2:
+        tag_filter = st.multiselect("Фільтр за тегами", all_tags) if all_tags else []
+    with f3:
+        sort_choice = st.selectbox("Сортувати", ["За балом", "За лайками", "За назвою"])
+
+    filtered = []
+    for it in items:
+        blob = f"{it['team']['name']} {it['sub'].get('description') or ''} {it['sub'].get('tags') or ''}".lower()
+        if search_q.strip() and search_q.strip().lower() not in blob:
             continue
+        if tag_filter:
+            item_tags = parse_tags(it["sub"].get("tags"))
+            if not any(tag in item_tags for tag in tag_filter):
+                continue
+        filtered.append(it)
 
-        scored.sort(key=lambda x: x[2] if x[2] is not None else -1, reverse=True)
-        found_any = True
-        st.markdown(f"### {ev['title']}")
-        st.caption(f"{ev['category']} · {ev['format']} · {ev['event_start'] or 'дата не вказана'}")
-
-        cols = st.columns(2)
-        for idx, (t, sub, score) in enumerate(scored):
-            with cols[idx % 2]:
-                with st.container(border=True):
-                    badge = " 🏆" if idx == 0 and score is not None else ""
-                    st.markdown(f"**{t['name']}**{badge}")
-                    st.caption(f"{t['faculty']}" + (f" · ⭐ {score} балів" if score is not None else ""))
-                    if sub[3]:
-                        preview = sub[3][:220] + ("…" if len(sub[3]) > 220 else "")
-                        st.write(preview)
-                    if sub[2]:
-                        st.video(youtube_embed_url(sub[2]))
-                    if sub[0]:
-                        st.write(f"🔗 [Репозиторій проєкту]({sub[0]})")
-                    files = query_df("""SELECT f.id, f.filename FROM files f
-                                         JOIN submissions s ON f.submission_id = s.id
-                                         WHERE s.team_id=? ORDER BY f.uploaded_at DESC LIMIT 1""", (t["id"],))
-                    if not files.empty:
-                        file_id = int(files.iloc[0]["id"])
-                        file_name = files.iloc[0]["filename"]
-                        blob_row = query_one("SELECT data, mimetype FROM files WHERE id=?", (file_id,))
-                        if blob_row:
-                            st.download_button(f"📄 Завантажити презентацію ({file_name})",
-                                                data=blob_row[0], file_name=file_name,
-                                                mime=blob_row[1] or "application/pdf",
-                                                key=f"showcase_file_{t['id']}")
-        st.markdown("---")
-
-    if not found_any:
+    if not filtered:
         st.info("За обраними фільтрами проєктів не знайдено.")
+        return
+
+    if sort_choice == "За балом":
+        filtered.sort(key=lambda x: x["score"] if x["score"] is not None else -1, reverse=True)
+    elif sort_choice == "За лайками":
+        filtered.sort(key=lambda x: x["likes"], reverse=True)
+    else:
+        filtered.sort(key=lambda x: x["team"]["name"])
+
+    max_likes = max((it["likes"] for it in filtered), default=0)
+    community_choice_team_id = None
+    if max_likes > 0:
+        community_choice_team_id = next(it["team"]["id"] for it in filtered if it["likes"] == max_likes)
+
+    best_score_per_event = {}
+    for it in items:
+        eid = it["event"]["id"]
+        if it["score"] is not None and (eid not in best_score_per_event or it["score"] > best_score_per_event[eid]):
+            best_score_per_event[eid] = it["score"]
+
+    st.caption(f"Знайдено проєктів: {len(filtered)}")
+
+    cols_per_row = 3
+    cols = st.columns(cols_per_row)
+    for idx, it in enumerate(filtered):
+        t, ev, sub, file_row = it["team"], it["event"], it["sub"], it["file"]
+        score, likes = it["score"], it["likes"]
+        with cols[idx % cols_per_row]:
+            with st.container(border=True):
+                badges = ""
+                if score is not None and best_score_per_event.get(ev["id"]) == score:
+                    badges += " 🏆"
+                if community_choice_team_id == t["id"]:
+                    badges += " ❤️"
+                st.markdown(f"**{t['name']}**{badges}")
+                st.caption(f"{ev['title']} · {t['faculty']}" + (f" · ⭐ {score}" if score is not None else ""))
+
+                tags = parse_tags(sub.get("tags"))
+                if tags:
+                    st.markdown(" ".join(f"`{tag}`" for tag in tags[:6]))
+
+                if sub.get("description"):
+                    preview = sub["description"][:140] + ("…" if len(sub["description"]) > 140 else "")
+                    st.write(preview)
+
+                like_col, detail_col = st.columns(2)
+                with like_col:
+                    liked = has_liked(t["id"])
+                    like_label = f"💔 {likes}" if liked else f"❤️ {likes}"
+                    if st.button(like_label, key=f"like_{t['id']}",
+                                 help="Проголосувати за проєкт (Community Choice Award)"):
+                        toggle_like(t["id"])
+                        st.rerun()
+                with detail_col:
+                    if st.button("🔍 Детальніше", key=f"detail_{t['id']}"):
+                        show_project_detail_dialog(int(t["id"]), t["name"], ev["title"], t["faculty"], score)
+
+                if sub.get("repo_link"):
+                    st.markdown(f"🔗 [Репозиторій]({sub['repo_link']})")
+                if sub.get("video_link"):
+                    with st.expander("🎬 Демо-відео"):
+                        st.video(youtube_embed_url(sub["video_link"]))
+                if file_row:
+                    with st.expander("👁️ Переглянути презентацію"):
+                        render_pdf_inline(file_row["data"], height=420)
+                        st.download_button("⬇️ Завантажити", data=file_row["data"], file_name=file_row["filename"],
+                                            mime=file_row["mimetype"] or "application/pdf",
+                                            key=f"dl_{t['id']}")
 
 
 def page_login():
@@ -1740,7 +2121,7 @@ def participant_my_team():
                 st.dataframe(members, use_container_width=True, hide_index=True)
 
                 st.markdown("#### 📦 Подача проєкту")
-                last_sub = query_one("""SELECT repo_link, presentation_link, video_link, description, version
+                last_sub = query_one("""SELECT repo_link, presentation_link, video_link, description, version, tags
                                          FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
                 with st.form(f"submit_form_{t['id']}"):
                     repo_link = st.text_input("Посилання на репозиторій (GitHub)",
@@ -1749,13 +2130,18 @@ def participant_my_team():
                                                 value=last_sub[2] if last_sub else "")
                     description = st.text_area("Опис проєкту",
                                                 value=last_sub[3] if last_sub else "")
+                    tags_input = st.text_input(
+                        "Технології / теги (через кому)",
+                        value=(last_sub[5] if last_sub and len(last_sub) > 5 and last_sub[5] else ""),
+                        help="Наприклад: Python, React, PostgreSQL — використовуються для пошуку у портфоліо.")
                     pdf_file = st.file_uploader("Презентація (PDF, до 50 МБ)", type=["pdf"], key=f"pdf_{t['id']}")
                     if st.form_submit_button("Зберегти / оновити подачу"):
                         new_version = (last_sub[4] + 1) if last_sub else 1
                         pres_link = last_sub[1] if last_sub else ""
                         sub_id = execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,
-                                           description,version,updated_at) VALUES (?,?,?,?,?,?,?)""",
-                                        (t["id"], repo_link, pres_link, video_link, description, new_version, now()))
+                                           description,version,updated_at,tags) VALUES (?,?,?,?,?,?,?,?)""",
+                                        (t["id"], repo_link, pres_link, video_link, description, new_version, now(),
+                                         tags_input))
                         if pdf_file is not None:
                             size_mb = pdf_file.size / (1024 * 1024)
                             if size_mb > MAX_PDF_MB:
