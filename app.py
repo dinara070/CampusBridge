@@ -50,9 +50,43 @@ ALLOWED_EMAIL_DOMAINS = [
 
 CATEGORIES = ["IT", "Наука", "Спорт", "Волонтерство", "Бізнес/Кейси"]
 FORMATS = ["Онлайн", "Офлайн", "Гібридний"]
-EVENT_STATUSES = ["Чернетка", "Реєстрація відкрита", "Триває подія", "Архів"]
+EVENT_STATUSES = ["Чернетка", "Реєстрація відкрита", "Закрито", "Триває подія", "Архів"]
 TEAM_STATUSES = ["На розгляді", "Прийнято", "Потребує доопрацювання", "Відхилено"]
 MAX_PDF_MB = 50
+
+EVENT_TEMPLATES = {
+    "🏆 Класичний хакатон": {
+        "category": "IT", "format": "Гібридний", "min_team": 2, "max_team": 5,
+        "description": "Класичний хакатон: команди за обмежений час (24-48 годин) розробляють "
+                       "робочий прототип проєкту від ідеї до демо.",
+        "regulations": "Учасники формують команди 2-5 осіб. Час на розробку — 24-48 годин. "
+                       "Фінал — пітчинг перед журі. Оцінюється інноваційність, технічна реалізація "
+                       "та якість презентації.",
+        "prize_fund": "50 000 грн", "max_teams": 20, "double_blind": 0, "jury_see_other_scores": 0,
+        "nominations": ["AI / Machine Learning", "Web / Mobile розробка", "IoT / Hardware"],
+        "criteria": [("Інноваційність", 30, 10), ("Технічна реалізація", 40, 10), ("Презентація", 30, 10)],
+    },
+    "💼 Кейс-чемпіонат": {
+        "category": "Бізнес/Кейси", "format": "Офлайн", "min_team": 3, "max_team": 5,
+        "description": "Кейс-чемпіонат: команди аналізують реальний бізнес-кейс від партнера "
+                       "й презентують обґрунтоване рішення журі з індустрії.",
+        "regulations": "Кейс видається на початку події. Час на підготовку рішення — 4-6 годин. "
+                       "Оцінюється глибина аналізу, практична застосовність рішення та презентація.",
+        "prize_fund": "30 000 грн", "max_teams": 15, "double_blind": 1, "jury_see_other_scores": 1,
+        "nominations": ["Маркетингова стратегія", "Фінансова модель", "Операційна ефективність"],
+        "criteria": [("Аналітична глибина", 35, 10), ("Практична застосовність", 35, 10),
+                     ("Презентація рішення", 30, 10)],
+    },
+    "🏅 Спортивний челендж": {
+        "category": "Спорт", "format": "Офлайн", "min_team": 1, "max_team": 10,
+        "description": "Спортивний челендж/турнір між факультетами чи закладами освіти.",
+        "regulations": "Змагання проходять за стандартними спортивними правилами обраної дисципліни. "
+                       "Реєстрація команд/учасників — заздалегідь, за визначеним лімітом місць.",
+        "prize_fund": "Кубок і грамоти переможцям", "max_teams": 12, "double_blind": 0,
+        "jury_see_other_scores": 1, "nominations": [],
+        "criteria": [("Результат/час", 60, 10), ("Командна взаємодія", 20, 10), ("Фейр-плей", 20, 10)],
+    },
+}
 
 st.set_page_config(page_title="CampusBridge", page_icon="🎓", layout="wide")
 
@@ -191,6 +225,10 @@ def init_db():
         c.execute("ALTER TABLE events ADD COLUMN banner_url TEXT")
     if "video_url" not in existing_cols:
         c.execute("ALTER TABLE events ADD COLUMN video_url TEXT")
+    if "max_teams" not in existing_cols:
+        c.execute("ALTER TABLE events ADD COLUMN max_teams INTEGER")
+    if "jury_see_other_scores" not in existing_cols:
+        c.execute("ALTER TABLE events ADD COLUMN jury_see_other_scores INTEGER DEFAULT 0")
     conn.commit()
 
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
@@ -669,6 +707,21 @@ def has_conflict(event_id, team_id, jury_user):
     return team[0] == jury_user.get("faculty")
 
 
+def maybe_autoclose_registration(event_id):
+    """Якщо кількість зареєстрованих команд досягла ліміту, автоматично закриває реєстрацію."""
+    ev = query_one("SELECT max_teams, status FROM events WHERE id=?", (event_id,))
+    if not ev:
+        return False
+    max_teams, status = ev
+    if not max_teams or status != "Реєстрація відкрита":
+        return False
+    count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (event_id,))[0]
+    if count >= max_teams:
+        execute("UPDATE events SET status='Закрито' WHERE id=?", (event_id,))
+        return True
+    return False
+
+
 # ============================================================
 # СТАН СЕСІЇ
 # ============================================================
@@ -744,7 +797,13 @@ def page_calendar():
                     if ev["prize_fund"]:
                         st.metric("Призовий фонд", ev["prize_fund"])
                     teams_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev["id"],))[0]
-                    st.metric("Команд подано", teams_count)
+                    if ev.get("max_teams"):
+                        st.metric("Команд подано", f"{teams_count} / {int(ev['max_teams'])}")
+                        st.progress(min(teams_count / int(ev["max_teams"]), 1.0))
+                        if ev["status"] == "Закрито":
+                            st.caption("🔒 Реєстрацію закрито — ліміт команд вичерпано")
+                    else:
+                        st.metric("Команд подано", teams_count)
 
                 if ev.get("video_url"):
                     with st.expander("🎬 Промо-відео"):
@@ -1052,6 +1111,19 @@ def page_login():
 
 def admin_event_builder():
     st.subheader("🛠️ Конструктор подій")
+
+    with st.expander("🧩 Створити на основі шаблону"):
+        st.caption("Оберіть шаблон — форма нижче заповниться типовими налаштуваннями "
+                   "(категорія, тривалість, критерії, номінації, ліміт команд). "
+                   "Будь-яке поле можна змінити перед збереженням.")
+        tmpl_name = st.selectbox("Шаблон події", ["— без шаблону —"] + list(EVENT_TEMPLATES.keys()))
+        if st.button("Застосувати шаблон до нової події") and tmpl_name != "— без шаблону —":
+            st.session_state["_event_template"] = EVENT_TEMPLATES[tmpl_name]
+            st.session_state["_event_template_name"] = tmpl_name
+            st.success(f"Шаблон «{tmpl_name}» застосовано до форми нижче. "
+                       "Заповніть назву та дати, перевірте поля й натисніть «Зберегти подію».")
+            st.rerun()
+
     events = get_events()
     options = ["➕ Створити нову подію"] + [
         f"{(row['title'] if row['title'] else '(без назви)')} (#{row['id']})"
@@ -1060,20 +1132,27 @@ def admin_event_builder():
     choice = st.selectbox("Подія", options)
 
     editing_id = None
+    active_template = None
     if choice != "➕ Створити нову подію":
         editing_id = int(choice.split("#")[-1].rstrip(")"))
         ev = query_one("SELECT * FROM events WHERE id=?", (editing_id,))
         cols = ["id","title","category","format","description","regulations","reg_start","reg_end",
                 "event_start","pitch_deadline","min_team","max_team","prize_fund","status",
                 "leaderboard_live","avoid_conflict","university","faculty","created_by","created_at",
-                "double_blind","banner_url","video_url"]
+                "double_blind","banner_url","video_url","max_teams","jury_see_other_scores"]
         ev = dict(zip(cols, ev))
     else:
         ev = {c: "" for c in ["title","category","format","description","regulations",
                                "prize_fund","banner_url","video_url"]}
         ev.update({"status": "Чернетка", "min_team": 2, "max_team": 5,
                    "leaderboard_live": 0, "avoid_conflict": 1, "double_blind": 0,
+                   "jury_see_other_scores": 0, "max_teams": None,
                    "university": MAIN_UNIVERSITY, "faculty": MAIN_FACULTY})
+        active_template = st.session_state.get("_event_template")
+        if active_template:
+            st.info(f"📋 Активний шаблон: **{st.session_state.get('_event_template_name')}** "
+                    "(поля нижче заповнено автоматично)")
+            ev.update({k: v for k, v in active_template.items() if k not in ("nominations", "criteria")})
 
     with st.form("event_form"):
         title = st.text_input("Назва події", value=ev.get("title", ""))
@@ -1104,6 +1183,23 @@ def admin_event_builder():
         with d4:
             pitch_deadline = st.text_input("Дедлайн пітчингу", value=ev.get("pitch_deadline") or "")
 
+        st.markdown("**Ліміти та автоматичне закриття реєстрації**")
+        l1, l2 = st.columns(2)
+        with l1:
+            max_teams_val = ev.get("max_teams")
+            max_teams_enabled = st.checkbox("Обмежити максимальну кількість команд-учасниць",
+                                             value=bool(max_teams_val))
+        with l2:
+            max_teams = st.number_input("Максимум команд на подію", min_value=1, max_value=1000,
+                                         value=int(max_teams_val) if max_teams_val else 20,
+                                         disabled=not max_teams_enabled)
+        if editing_id:
+            current_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (editing_id,))[0]
+            if max_teams_enabled:
+                st.caption(f"Зареєстровано зараз: {current_count} / {max_teams} команд. "
+                           "Коли ліміт буде вичерпано, статус події автоматично зміниться на «Закрито».")
+        st.caption("Якщо галочку знято — кількість команд необмежена.")
+
         c3, c4 = st.columns(2)
         with c3:
             leaderboard_live = st.checkbox("Транслювати лідерборд у реальному часі", value=bool(ev.get("leaderboard_live")))
@@ -1111,11 +1207,20 @@ def admin_event_builder():
             avoid_conflict = st.checkbox("Забороняти журі оцінювати команди свого факультету (конфлікт інтересів)",
                                           value=bool(ev.get("avoid_conflict", 1)))
 
-        double_blind = st.checkbox(
-            "🕶️ Сліпе оцінювання (double-blind): журі не бачить назву команди та факультет під час оцінювання",
-            value=bool(ev.get("double_blind", 0)),
-            help="Команди відображатимуться журі під анонімним кодом (наприклад, «Команда №A1B2»). "
-                 "Захист від конфлікту інтересів за факультетом продовжує діяти автоматично, навіть якщо факультет прихований.")
+        st.markdown("**Налаштування журі**")
+        j1, j2 = st.columns(2)
+        with j1:
+            double_blind = st.checkbox(
+                "🕶️ Сліпе оцінювання (double-blind): журі не бачить назву команди та факультет",
+                value=bool(ev.get("double_blind", 0)),
+                help="Команди відображатимуться журі під анонімним кодом (наприклад, «Команда №A1B2»). "
+                     "Захист від конфлікту інтересів за факультетом продовжує діяти автоматично.")
+        with j2:
+            jury_see_other_scores = st.checkbox(
+                "👀 Журі бачать оцінки та фідбек одне одного під час оцінювання",
+                value=bool(ev.get("jury_see_other_scores", 0)),
+                help="Якщо увімкнено — кожен експерт бачить бали й коментарі колег по цій же команді "
+                     "(прозорий процес). Якщо вимкнено — кожен журі оцінює незалежно, не бачачи чужих оцінок.")
 
         st.markdown("**Медіа**")
         m1, m2 = st.columns(2)
@@ -1129,25 +1234,37 @@ def admin_event_builder():
             if not title:
                 st.error("Вкажіть назву події.")
             else:
+                final_max_teams = int(max_teams) if max_teams_enabled else None
                 if editing_id:
                     execute("""UPDATE events SET title=?, category=?, format=?, description=?, regulations=?,
                                reg_start=?, reg_end=?, event_start=?, pitch_deadline=?, min_team=?, max_team=?,
                                prize_fund=?, status=?, leaderboard_live=?, avoid_conflict=?, double_blind=?,
-                               banner_url=?, video_url=? WHERE id=?""",
+                               banner_url=?, video_url=?, max_teams=?, jury_see_other_scores=? WHERE id=?""",
                             (title, category, fmt, description, regulations, reg_start, reg_end, event_start,
                              pitch_deadline, min_team, max_team, prize, status, int(leaderboard_live),
-                             int(avoid_conflict), int(double_blind), banner_url, video_url, editing_id))
+                             int(avoid_conflict), int(double_blind), banner_url, video_url, final_max_teams,
+                             int(jury_see_other_scores), editing_id))
+                    maybe_autoclose_registration(editing_id)
                     st.success("Подію оновлено.")
                 else:
                     new_id = execute("""INSERT INTO events (title,category,format,description,regulations,
                                         reg_start,reg_end,event_start,pitch_deadline,min_team,max_team,prize_fund,
                                         status,leaderboard_live,avoid_conflict,university,faculty,created_by,created_at,
-                                        double_blind,banner_url,video_url)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        double_blind,banner_url,video_url,max_teams,jury_see_other_scores)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                      (title, category, fmt, description, regulations, reg_start, reg_end,
                                       event_start, pitch_deadline, min_team, max_team, prize, status,
                                       int(leaderboard_live), int(avoid_conflict), MAIN_UNIVERSITY, MAIN_FACULTY,
-                                      st.session_state.user["id"], now(), int(double_blind), banner_url, video_url))
+                                      st.session_state.user["id"], now(), int(double_blind), banner_url, video_url,
+                                      final_max_teams, int(jury_see_other_scores)))
+                    if active_template:
+                        for nom in active_template.get("nominations", []):
+                            execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (new_id, nom))
+                        for cname, cw, cmax in active_template.get("criteria", []):
+                            execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
+                                    (new_id, cname, cw, cmax))
+                        st.session_state.pop("_event_template", None)
+                        st.session_state.pop("_event_template_name", None)
                     st.success(f"Подію створено (ID {new_id}).")
                 st.rerun()
 
@@ -1448,12 +1565,17 @@ def admin_import_export():
             st.dataframe(imp_df, use_container_width=True, hide_index=True)
             if st.button("Підтвердити імпорт команд"):
                 count = 0
+                affected_events = set()
                 for _, r in imp_df.iterrows():
+                    ev_id_val = int(r.get("event_id"))
                     execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
                                faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (int(r.get("event_id")), None, r.get("name"), None, gen_code(),
+                            (ev_id_val, None, r.get("name"), None, gen_code(),
                              r.get("faculty", ""), r.get("status", "На розгляді"), "", now()))
+                    affected_events.add(ev_id_val)
                     count += 1
+                for eid in affected_events:
+                    maybe_autoclose_registration(eid)
                 st.success(f"Імпортовано {count} команд(и).")
         except Exception as e:
             st.error(f"Помилка обробки файлу: {e}")
@@ -1529,6 +1651,11 @@ def participant_my_team():
     with tab2:
         st.markdown("##### Створити нову команду (я — капітан)")
         events = get_events("Реєстрація відкрита")
+        # самозцілення: якщо ліміт команд вже вичерпано (наприклад, після зміни адміном),
+        # закриваємо реєстрацію ще до показу форми
+        for _, ev_row in events.iterrows():
+            maybe_autoclose_registration(int(ev_row["id"]))
+        events = get_events("Реєстрація відкрита")
         if events.empty:
             st.info("Наразі немає подій з відкритою реєстрацією.")
         else:
@@ -1536,6 +1663,12 @@ def participant_my_team():
                 ev_map = dict(zip(events["title"], events["id"]))
                 ev_title = st.selectbox("Подія", list(ev_map.keys()))
                 ev_id = ev_map[ev_title]
+
+                ev_limit = query_one("SELECT max_teams FROM events WHERE id=?", (ev_id,))
+                if ev_limit and ev_limit[0]:
+                    reg_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev_id,))[0]
+                    st.caption(f"Заповнено місць: {reg_count} / {ev_limit[0]}")
+
                 noms = query_df("SELECT id, name FROM nominations WHERE event_id=?", (ev_id,))
                 nom_id = None
                 if not noms.empty:
@@ -1545,13 +1678,25 @@ def participant_my_team():
                 team_name = st.text_input("Назва команди")
                 faculty = st.text_input("Факультет", value=user.get("faculty") or MAIN_FACULTY)
                 if st.form_submit_button("Створити команду") and team_name:
-                    code = gen_code()
-                    tid = execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
-                                     faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
-                                  (ev_id, nom_id, team_name, user["id"], code, faculty, "На розгляді", "", now()))
-                    execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (tid, user["id"]))
-                    st.success(f"Команду створено! Інвайт-код для запрошення учасників: **{code}**")
-                    st.rerun()
+                    # перевірка ліміту безпосередньо перед записом (захист від перегонів)
+                    ev_check = query_one("SELECT max_teams, status FROM events WHERE id=?", (ev_id,))
+                    current_count = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev_id,))[0]
+                    if ev_check and ev_check[1] != "Реєстрація відкрита":
+                        st.error("На жаль, реєстрацію на цю подію щойно закрито. Оберіть іншу подію.")
+                    elif ev_check and ev_check[0] and current_count >= ev_check[0]:
+                        execute("UPDATE events SET status='Закрито' WHERE id=?", (ev_id,))
+                        st.error("На жаль, ліміт команд на цю подію вичерпано. Реєстрацію закрито.")
+                    else:
+                        code = gen_code()
+                        tid = execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
+                                         faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                                      (ev_id, nom_id, team_name, user["id"], code, faculty, "На розгляді", "", now()))
+                        execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (tid, user["id"]))
+                        closed_now = maybe_autoclose_registration(ev_id)
+                        st.success(f"Команду створено! Інвайт-код для запрошення учасників: **{code}**")
+                        if closed_now:
+                            st.info("ℹ️ Це була остання вільна квота — реєстрацію на подію щойно автоматично закрито.")
+                        st.rerun()
 
         st.markdown("##### Приєднатись за інвайт-кодом")
         with st.form("join_team_form"):
@@ -1755,10 +1900,13 @@ def jury_evaluation():
     ev_id = int(assignments[assignments["event_title"] == ev_title]["event_id"].iloc[0])
     nom_ids = assignments[assignments["event_title"] == ev_title]["nomination_id"].tolist()
 
-    ev_row = query_one("SELECT double_blind FROM events WHERE id=?", (ev_id,))
+    ev_row = query_one("SELECT double_blind, jury_see_other_scores FROM events WHERE id=?", (ev_id,))
     double_blind = bool(ev_row[0]) if ev_row else False
+    jury_see_other_scores = bool(ev_row[1]) if ev_row else False
     if double_blind:
         st.info("🕶️ Для цієї події увімкнено **сліпе оцінювання** — назви команд і факультети приховано.")
+    if jury_see_other_scores:
+        st.caption("👀 Для цієї події увімкнено прозорий режим — ви бачите оцінки й фідбек колег по журі.")
 
     if any(pd.isna(n) for n in nom_ids):
         teams = query_df("SELECT * FROM teams WHERE event_id=? AND status='Прийнято'", (ev_id,))
@@ -1801,6 +1949,18 @@ def jury_evaluation():
                     st.write(f"📄 Презентація: {files.iloc[0]['filename']}")
             else:
                 st.warning("Команда ще не завантажила подачу.")
+
+            if jury_see_other_scores:
+                others = query_df("""SELECT c.name AS criterion, u.full_name AS jury, s.score, s.feedback
+                                      FROM scores s JOIN criteria c ON s.criterion_id=c.id
+                                      JOIN users u ON s.jury_id=u.id
+                                      WHERE s.team_id=? AND s.jury_id!=?
+                                      ORDER BY c.id, u.full_name""", (t["id"], user["id"]))
+                if not others.empty:
+                    with st.expander("👥 Оцінки та фідбек інших членів журі по цій команді"):
+                        st.dataframe(others.rename(columns={"criterion": "Критерій", "jury": "Журі",
+                                                             "score": "Оцінка", "feedback": "Фідбек"}),
+                                     use_container_width=True, hide_index=True)
 
             with st.form(f"score_form_{t['id']}"):
                 score_vals = {}
