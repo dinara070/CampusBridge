@@ -1945,99 +1945,448 @@ def admin_team_moderation():
 
 def admin_jury():
     st.subheader("⚖️ Керування журі")
-    st.markdown("#### Створити обліковий запис журі/експерта")
-    with st.form("jury_create"):
-        full_name = st.text_input("ПІБ експерта")
-        username = st.text_input("Логін")
-        email = st.text_input("Пошта")
-        faculty = st.text_input("Факультет/кафедра (для перевірки конфлікту інтересів)")
-        temp_pw = st.text_input("Тимчасовий пароль", value=gen_code(8))
-        if st.form_submit_button("Створити") and full_name and username:
-            existing = query_one("SELECT id FROM users WHERE username=?", (username,))
-            if existing:
-                st.error("Такий логін вже існує.")
+    tab_create, tab_manage, tab_assign, tab_progress = st.tabs(
+        ["➕ Створити", "👥 Список і керування", "🗂️ Розподіл за подіями", "📊 Прогрес оцінювання"])
+
+    # ---------------------------------------------------------------
+    # Створення нового журі
+    # ---------------------------------------------------------------
+    with tab_create:
+        st.markdown("#### Створити обліковий запис журі/експерта")
+        with st.form("jury_create"):
+            full_name = st.text_input("ПІБ експерта")
+            username = st.text_input("Логін")
+            email = st.text_input("Пошта")
+            faculty = st.text_input("Факультет/кафедра (для перевірки конфлікту інтересів)")
+            temp_pw = st.text_input("Тимчасовий пароль", value=gen_code(8))
+            if st.form_submit_button("Створити") and full_name and username:
+                existing = query_one("SELECT id FROM users WHERE username=?", (username,))
+                if existing:
+                    st.error("Такий логін вже існує.")
+                else:
+                    execute("""INSERT INTO users (username,password,role,full_name,email,university,faculty,created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (username, hash_pw(temp_pw), "jury", full_name, email, MAIN_UNIVERSITY, faculty, now()))
+                    st.success(f"Журі створено. Логін: {username} / Пароль: {temp_pw}")
+
+    # ---------------------------------------------------------------
+    # Список та керування обліковими записами журі
+    # ---------------------------------------------------------------
+    with tab_manage:
+        st.markdown("#### Список журі")
+        jury_all = query_df("SELECT id, username, full_name, email, faculty FROM users WHERE role='jury' ORDER BY full_name")
+        if jury_all.empty:
+            st.info("Журі ще не створено. Скористайтесь вкладкою «➕ Створити».")
+        else:
+            search = st.text_input("🔎 Пошук за ПІБ, логіном або поштою", key="jury_search")
+            view = jury_all
+            if search.strip():
+                q = search.strip().lower()
+                view = jury_all[
+                    jury_all["full_name"].fillna("").str.lower().str.contains(q)
+                    | jury_all["username"].fillna("").str.lower().str.contains(q)
+                    | jury_all["email"].fillna("").str.lower().str.contains(q)
+                ]
+
+            # швидка статистика навантаження: скільки подій та скільки оцінок уже виставлено
+            workload_rows = []
+            for _, j in view.iterrows():
+                n_assign = query_one("SELECT COUNT(*) FROM jury_assignments WHERE jury_id=?", (j["id"],))[0]
+                n_scores = query_one("SELECT COUNT(*) FROM scores WHERE jury_id=?", (j["id"],))[0]
+                workload_rows.append({"ID": j["id"], "Логін": j["username"], "ПІБ": j["full_name"],
+                                       "Пошта": j["email"], "Факультет": j["faculty"],
+                                       "Призначень": n_assign, "Виставлено оцінок": n_scores})
+            st.dataframe(pd.DataFrame(workload_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Редагування обраного журі")
+            jmap_edit = dict(zip(view["full_name"] + " (" + view["username"] + ")", view["id"]))
+            if jmap_edit:
+                sel_label = st.selectbox("Оберіть журі", list(jmap_edit.keys()), key="jury_edit_select")
+                jid = int(jmap_edit[sel_label])
+                jrow = query_one("SELECT full_name, email, faculty FROM users WHERE id=?", (jid,))
+
+                with st.form(f"jury_edit_form_{jid}"):
+                    new_name = st.text_input("ПІБ", value=jrow[0] or "")
+                    new_email = st.text_input("Пошта", value=jrow[1] or "")
+                    new_faculty = st.text_input("Факультет/кафедра", value=jrow[2] or "")
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        save_btn = st.form_submit_button("💾 Зберегти зміни")
+                    with ec2:
+                        reset_pw_btn = st.form_submit_button("🔑 Скинути пароль")
+                    if save_btn:
+                        execute("UPDATE users SET full_name=?, email=?, faculty=? WHERE id=?",
+                                (new_name, new_email, new_faculty, jid))
+                        st.success("Дані журі оновлено.")
+                        st.rerun()
+                    if reset_pw_btn:
+                        new_pw = gen_code(8)
+                        execute("UPDATE users SET password=? WHERE id=?", (hash_pw(new_pw), jid))
+                        st.success(f"Новий тимчасовий пароль для {jrow[0]}: **{new_pw}** "
+                                   "(передайте його журі особисто, не публічно).")
+
+                st.markdown("##### 🗑️ Видалення облікового запису")
+                st.caption("Видалення можливе лише якщо в журі немає збережених оцінок чи призначень — "
+                           "інакше спершу заберіть призначення на вкладці «Розподіл за подіями».")
+                if st.button("Видалити обраного журі", key=f"del_jury_{jid}"):
+                    try:
+                        execute("DELETE FROM users WHERE id=?", (jid,))
+                        st.success("Журі видалено.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Неможливо видалити: у журі вже є призначення та/або збережені оцінки.")
+
+    # ---------------------------------------------------------------
+    # Розподіл журі за подіями/номінаціями
+    # ---------------------------------------------------------------
+    with tab_assign:
+        events = get_events()
+        if events.empty:
+            st.info("Спочатку створіть подію.")
+        else:
+            ev_map = dict(zip(events["title"], events["id"]))
+            ev_title = st.selectbox("Подія", list(ev_map.keys()), key="jury_event")
+            ev_id = ev_map[ev_title]
+
+            jury_list = query_df("SELECT id, full_name, faculty FROM users WHERE role='jury'")
+            noms = query_df("SELECT id, name FROM nominations WHERE event_id=?", (ev_id,))
+            if jury_list.empty:
+                st.info("Спершу створіть облікові записи журі на вкладці «➕ Створити».")
             else:
-                execute("""INSERT INTO users (username,password,role,full_name,email,university,faculty,created_at)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (username, hash_pw(temp_pw), "jury", full_name, email, MAIN_UNIVERSITY, faculty, now()))
-                st.success(f"Журі створено. Логін: {username} / Пароль: {temp_pw}")
+                with st.form("assign_form"):
+                    jmap = dict(zip(jury_list["full_name"], jury_list["id"]))
+                    jname = st.selectbox("Журі", list(jmap.keys()))
+                    nmap = {"— вся подія —": None}
+                    nmap.update(dict(zip(noms["name"], noms["id"])))
+                    nname = st.selectbox("Номінація", list(nmap.keys()))
+                    if st.form_submit_button("Призначити"):
+                        already = query_one(
+                            """SELECT id FROM jury_assignments WHERE event_id=? AND jury_id=?
+                               AND (nomination_id IS ? OR nomination_id=?)""",
+                            (ev_id, jmap[jname], nmap[nname], nmap[nname]))
+                        if already:
+                            st.warning("Це журі вже призначено на цю подію/номінацію.")
+                        else:
+                            execute("INSERT INTO jury_assignments (event_id,jury_id,nomination_id) VALUES (?,?,?)",
+                                    (ev_id, jmap[jname], nmap[nname]))
+                            st.success("Журі призначено.")
+                            st.rerun()
 
-    st.markdown("#### Розподіл журі за номінаціями")
-    events = get_events()
-    if events.empty:
-        return
-    ev_map = dict(zip(events["title"], events["id"]))
-    ev_title = st.selectbox("Подія", list(ev_map.keys()), key="jury_event")
-    ev_id = ev_map[ev_title]
+                st.markdown("#### Поточні призначення")
+                assign_df = query_df("""SELECT ja.id, u.full_name AS jury, u.faculty,
+                                                COALESCE(n.name,'вся подія') AS nomination
+                                         FROM jury_assignments ja
+                                         JOIN users u ON ja.jury_id=u.id
+                                         LEFT JOIN nominations n ON ja.nomination_id=n.id
+                                         WHERE ja.event_id=?""", (ev_id,))
+                if assign_df.empty:
+                    st.caption("Журі на цю подію ще не призначено.")
+                else:
+                    ev_conflict = query_one("SELECT avoid_conflict FROM events WHERE id=?", (ev_id,))
+                    avoid_conflict_on = bool(ev_conflict[0]) if ev_conflict else False
+                    for _, a in assign_df.iterrows():
+                        c1, c2 = st.columns([5, 1])
+                        with c1:
+                            line = f"**{a['jury']}** · {a['nomination']} · факультет: {a['faculty'] or '—'}"
+                            if avoid_conflict_on and a["faculty"] == MAIN_FACULTY:
+                                line += "  \n⚠️ *Може мати конфлікт інтересів з командами свого факультету — оцінювання таких команд для цього журі автоматично заблоковано.*"
+                            st.markdown(line)
+                        with c2:
+                            if st.button("🗑️ Зняти", key=f"unassign_{a['id']}"):
+                                execute("DELETE FROM jury_assignments WHERE id=?", (int(a["id"]),))
+                                st.rerun()
 
-    jury_list = query_df("SELECT id, full_name, faculty FROM users WHERE role='jury'")
-    noms = query_df("SELECT id, name FROM nominations WHERE event_id=?", (ev_id,))
-    if jury_list.empty:
-        st.info("Спершу створіть облікові записи журі.")
-        return
+    # ---------------------------------------------------------------
+    # Прогрес оцінювання: хто ще не завершив
+    # ---------------------------------------------------------------
+    with tab_progress:
+        events2 = get_events()
+        if events2.empty:
+            st.info("Немає подій для аналізу прогресу.")
+        else:
+            ev_map3 = dict(zip(events2["title"], events2["id"]))
+            ev_title3 = st.selectbox("Подія", list(ev_map3.keys()), key="jury_progress_event")
+            ev_id3 = ev_map3[ev_title3]
 
-    with st.form("assign_form"):
-        jmap = dict(zip(jury_list["full_name"], jury_list["id"]))
-        jname = st.selectbox("Журі", list(jmap.keys()))
-        nmap = {"— вся подія —": None}
-        nmap.update(dict(zip(noms["name"], noms["id"])))
-        nname = st.selectbox("Номінація", list(nmap.keys()))
-        if st.form_submit_button("Призначити"):
-            execute("INSERT INTO jury_assignments (event_id,jury_id,nomination_id) VALUES (?,?,?)",
-                    (ev_id, jmap[jname], nmap[nname]))
-            st.success("Журі призначено.")
+            assigns = query_df("""SELECT ja.jury_id, u.full_name, ja.nomination_id,
+                                          COALESCE(n.name,'вся подія') AS nomination
+                                   FROM jury_assignments ja
+                                   JOIN users u ON ja.jury_id=u.id
+                                   LEFT JOIN nominations n ON ja.nomination_id=n.id
+                                   WHERE ja.event_id=?""", (ev_id3,))
+            if assigns.empty:
+                st.info("Журі ще не призначено на цю подію.")
+            else:
+                teams_total_df = query_df("SELECT id, nomination_id, faculty FROM teams WHERE event_id=? AND status='Прийнято'",
+                                           (ev_id3,))
+                crit_count = query_one("SELECT COUNT(*) FROM criteria WHERE event_id=?", (ev_id3,))[0]
 
-    st.markdown("#### Поточні призначення")
-    assign_df = query_df("""SELECT ja.id, u.full_name AS jury, COALESCE(n.name,'вся подія') AS nomination
-                             FROM jury_assignments ja
-                             JOIN users u ON ja.jury_id=u.id
-                             LEFT JOIN nominations n ON ja.nomination_id=n.id
-                             WHERE ja.event_id=?""", (ev_id,))
-    st.dataframe(assign_df, use_container_width=True, hide_index=True)
+                rows = []
+                for _, a in assigns.iterrows():
+                    if pd.isna(a["nomination_id"]):
+                        scope_teams = teams_total_df
+                    else:
+                        scope_teams = teams_total_df[teams_total_df["nomination_id"] == a["nomination_id"]]
+                    # виключаємо команди, оцінювання яких для цього журі заблоковано через конфлікт інтересів
+                    scope_teams = scope_teams[scope_teams["faculty"] != MAIN_FACULTY] \
+                        if query_one("SELECT avoid_conflict FROM events WHERE id=?", (ev_id3,))[0] else scope_teams
+                    total_teams = len(scope_teams)
+                    scored_teams = 0
+                    for _, tt in scope_teams.iterrows():
+                        cnt = query_one("SELECT COUNT(DISTINCT criterion_id) FROM scores WHERE team_id=? AND jury_id=?",
+                                         (int(tt["id"]), int(a["jury_id"])))[0]
+                        if crit_count and cnt >= crit_count:
+                            scored_teams += 1
+                    pct = round(scored_teams / total_teams * 100, 1) if total_teams else 0.0
+                    rows.append({"Журі": a["full_name"], "Номінація": a["nomination"],
+                                 "Команд до оцінки": total_teams, "Оцінено повністю": scored_teams,
+                                 "Прогрес, %": pct})
+
+                prog_df = pd.DataFrame(rows)
+                st.dataframe(prog_df, use_container_width=True, hide_index=True)
+
+                if not prog_df.empty:
+                    st.progress(min(prog_df["Прогрес, %"].mean() / 100, 1.0))
+                    incomplete = prog_df[prog_df["Прогрес, %"] < 100]
+                    if not incomplete.empty:
+                        names = ", ".join(sorted(incomplete["Журі"].unique()))
+                        st.warning(f"⏳ Ще не завершили оцінювання всіх своїх команд: {names}")
+                    else:
+                        st.success("✅ Усі призначені журі завершили оцінювання своїх команд.")
+
+                st.markdown("#### ⚠️ Аномалії в оцінках цієї події")
+                anomalies = detect_anomalies(ev_id3)
+                if anomalies.empty:
+                    st.caption("Суттєвих розходжень в оцінках журі не виявлено.")
+                else:
+                    st.dataframe(anomalies, use_container_width=True, hide_index=True)
 
 
 def admin_mentors():
     st.subheader("🧑‍🏫 Ментори (Office Hours)")
-    st.markdown("#### Створити обліковий запис ментора")
-    with st.form("mentor_create"):
-        full_name = st.text_input("ПІБ ментора")
-        username = st.text_input("Логін")
-        email = st.text_input("Пошта")
-        faculty = st.text_input("Факультет / компанія / спеціалізація")
-        temp_pw = st.text_input("Тимчасовий пароль", value=gen_code(8))
-        if st.form_submit_button("Створити") and full_name and username:
-            existing = query_one("SELECT id FROM users WHERE username=?", (username,))
-            if existing:
-                st.error("Такий логін вже існує.")
+    tab_create, tab_manage, tab_slots, tab_stats = st.tabs(
+        ["➕ Створити", "👥 Список і керування", "🗓️ Огляд і керування слотами", "📊 Статистика"])
+
+    # ---------------------------------------------------------------
+    # Створення нового ментора
+    # ---------------------------------------------------------------
+    with tab_create:
+        st.markdown("#### Створити обліковий запис ментора")
+        with st.form("mentor_create"):
+            full_name = st.text_input("ПІБ ментора")
+            username = st.text_input("Логін")
+            email = st.text_input("Пошта")
+            faculty = st.text_input("Факультет / компанія / спеціалізація")
+            temp_pw = st.text_input("Тимчасовий пароль", value=gen_code(8))
+            if st.form_submit_button("Створити") and full_name and username:
+                existing = query_one("SELECT id FROM users WHERE username=?", (username,))
+                if existing:
+                    st.error("Такий логін вже існує.")
+                else:
+                    execute("""INSERT INTO users (username,password,role,full_name,email,university,faculty,created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (username, hash_pw(temp_pw), "mentor", full_name, email, MAIN_UNIVERSITY, faculty, now()))
+                    st.success(f"Ментора створено. Логін: {username} / Пароль: {temp_pw}")
+
+    # ---------------------------------------------------------------
+    # Список та керування обліковими записами менторів
+    # ---------------------------------------------------------------
+    with tab_manage:
+        st.markdown("#### Список менторів")
+        mentors_all = query_df("SELECT id, username, full_name, email, faculty FROM users WHERE role='mentor' ORDER BY full_name")
+        if mentors_all.empty:
+            st.info("Менторів ще не створено. Скористайтесь вкладкою «➕ Створити».")
+        else:
+            search_m = st.text_input("🔎 Пошук за ПІБ, логіном або поштою", key="mentor_search")
+            view_m = mentors_all
+            if search_m.strip():
+                q = search_m.strip().lower()
+                view_m = mentors_all[
+                    mentors_all["full_name"].fillna("").str.lower().str.contains(q)
+                    | mentors_all["username"].fillna("").str.lower().str.contains(q)
+                    | mentors_all["email"].fillna("").str.lower().str.contains(q)
+                ]
+
+            # навантаження: скільки слотів створено і скільки з них заброньовано
+            workload_rows = []
+            for _, m in view_m.iterrows():
+                n_slots = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=?", (m["id"],))[0]
+                n_booked = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=? AND is_booked=1", (m["id"],))[0]
+                workload_rows.append({"ID": m["id"], "Логін": m["username"], "ПІБ": m["full_name"],
+                                       "Пошта": m["email"], "Спеціалізація": m["faculty"],
+                                       "Слотів створено": n_slots, "З них заброньовано": n_booked})
+            st.dataframe(pd.DataFrame(workload_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Редагування обраного ментора")
+            mmap_edit = dict(zip(view_m["full_name"] + " (" + view_m["username"] + ")", view_m["id"]))
+            if mmap_edit:
+                sel_label_m = st.selectbox("Оберіть ментора", list(mmap_edit.keys()), key="mentor_edit_select")
+                mid = int(mmap_edit[sel_label_m])
+                mrow = query_one("SELECT full_name, email, faculty FROM users WHERE id=?", (mid,))
+
+                with st.form(f"mentor_edit_form_{mid}"):
+                    new_name_m = st.text_input("ПІБ", value=mrow[0] or "")
+                    new_email_m = st.text_input("Пошта", value=mrow[1] or "")
+                    new_spec_m = st.text_input("Спеціалізація / факультет / компанія", value=mrow[2] or "")
+                    emc1, emc2 = st.columns(2)
+                    with emc1:
+                        save_btn_m = st.form_submit_button("💾 Зберегти зміни")
+                    with emc2:
+                        reset_pw_btn_m = st.form_submit_button("🔑 Скинути пароль")
+                    if save_btn_m:
+                        execute("UPDATE users SET full_name=?, email=?, faculty=? WHERE id=?",
+                                (new_name_m, new_email_m, new_spec_m, mid))
+                        st.success("Дані ментора оновлено.")
+                        st.rerun()
+                    if reset_pw_btn_m:
+                        new_pw_m = gen_code(8)
+                        execute("UPDATE users SET password=? WHERE id=?", (hash_pw(new_pw_m), mid))
+                        st.success(f"Новий тимчасовий пароль для {mrow[0]}: **{new_pw_m}** "
+                                   "(передайте його ментору особисто, не публічно).")
+
+                st.markdown("##### 🗑️ Видалення облікового запису")
+                m_slot_count = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=?", (mid,))[0]
+                if m_slot_count:
+                    st.caption(f"У ментора є {m_slot_count} слот(ів) у розкладі. Видалення користувача автоматично "
+                               "звільнить заброньовані на нього слоти командам (запис буде видалено).")
+                if st.button("Видалити обраного ментора", key=f"del_mentor_{mid}"):
+                    try:
+                        execute("DELETE FROM mentor_slots WHERE mentor_id=?", (mid,))
+                        execute("DELETE FROM users WHERE id=?", (mid,))
+                        st.success("Ментора та його слоти видалено.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Неможливо видалити обліковий запис через пов'язані дані.")
+
+    # ---------------------------------------------------------------
+    # Огляд і ручне керування всіма слотами Office Hours
+    # ---------------------------------------------------------------
+    with tab_slots:
+        events = get_events()
+        if events.empty:
+            st.info("Подій ще немає.")
+        else:
+            ev_map = dict(zip(events["title"], events["id"]))
+            ev_title = st.selectbox("Подія", list(ev_map.keys()), key="mentor_overview_event")
+            ev_id = ev_map[ev_title]
+
+            mentors_for_ev = query_df("""SELECT DISTINCT u.id, u.full_name FROM mentor_slots ms
+                                          JOIN users u ON ms.mentor_id=u.id WHERE ms.event_id=?""", (ev_id,))
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                mentor_filter_map = {"Усі ментори": None}
+                mentor_filter_map.update(dict(zip(mentors_for_ev["full_name"], mentors_for_ev["id"])))
+                mentor_filter_name = st.selectbox("Ментор", list(mentor_filter_map.keys()))
+            with fcol2:
+                status_filter_m = st.selectbox("Статус", ["Усі", "Тільки вільні", "Тільки заброньовані"])
+
+            sql = """SELECT ms.id, ms.mentor_id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
+                            ms.location, ms.team_id, COALESCE(t.name,'—') AS team,
+                            CASE WHEN ms.is_booked=1 THEN 'заброньовано' ELSE 'вільно' END AS status
+                     FROM mentor_slots ms
+                     JOIN users u ON ms.mentor_id=u.id
+                     LEFT JOIN teams t ON ms.team_id=t.id
+                     WHERE ms.event_id=?"""
+            params = [ev_id]
+            if mentor_filter_map[mentor_filter_name] is not None:
+                sql += " AND ms.mentor_id=?"
+                params.append(mentor_filter_map[mentor_filter_name])
+            if status_filter_m == "Тільки вільні":
+                sql += " AND ms.is_booked=0"
+            elif status_filter_m == "Тільки заброньовані":
+                sql += " AND ms.is_booked=1"
+            sql += " ORDER BY ms.slot_date, ms.start_time"
+            slots = query_df(sql, params)
+
+            if slots.empty:
+                st.info("Слотів за обраними фільтрами не знайдено.")
             else:
-                execute("""INSERT INTO users (username,password,role,full_name,email,university,faculty,created_at)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (username, hash_pw(temp_pw), "mentor", full_name, email, MAIN_UNIVERSITY, faculty, now()))
-                st.success(f"Ментора створено. Логін: {username} / Пароль: {temp_pw}")
+                st.dataframe(slots[["id", "mentor", "slot_date", "start_time", "end_time", "location", "team", "status"]],
+                             use_container_width=True, hide_index=True)
 
-    st.markdown("#### Список менторів")
-    mentors = query_df("SELECT id, full_name, email, faculty FROM users WHERE role='mentor'")
-    st.dataframe(mentors, use_container_width=True, hide_index=True)
+                st.markdown("#### Керування окремими слотами")
+                teams_for_ev = query_df("SELECT id, name FROM teams WHERE event_id=?", (ev_id,))
+                team_map_admin = dict(zip(teams_for_ev["name"], teams_for_ev["id"]))
+                for _, s in slots.iterrows():
+                    with st.container(border=True):
+                        st.write(f"**#{s['id']}** · {s['mentor']} · {s['slot_date']} {s['start_time']}–{s['end_time']} "
+                                 f"· {s['location'] or 'онлайн'} · **{s['status']}** ({s['team']})")
+                        bc1, bc2, bc3 = st.columns([2, 1, 1])
+                        if s["team_id"]:
+                            with bc1:
+                                st.caption(f"Заброньовано командою «{s['team']}».")
+                            with bc2:
+                                if st.button("🔓 Звільнити слот", key=f"unbook_{s['id']}"):
+                                    execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE id=?", (int(s["id"]),))
+                                    st.rerun()
+                        else:
+                            with bc1:
+                                if team_map_admin:
+                                    force_team_name = st.selectbox("Призначити команду вручну", list(team_map_admin.keys()),
+                                                                    key=f"force_team_{s['id']}")
+                                else:
+                                    force_team_name = None
+                            with bc2:
+                                if team_map_admin and st.button("📌 Призначити", key=f"force_assign_{s['id']}"):
+                                    execute("UPDATE mentor_slots SET is_booked=1, team_id=? WHERE id=?",
+                                            (int(team_map_admin[force_team_name]), int(s["id"])))
+                                    st.rerun()
+                        with bc3:
+                            if st.button("🗑️ Видалити слот", key=f"del_slot_admin_{s['id']}"):
+                                execute("DELETE FROM mentor_slots WHERE id=?", (int(s["id"]),))
+                                st.rerun()
 
-    st.markdown("---")
-    st.markdown("#### Огляд усіх слотів Office Hours")
-    events = get_events()
-    if events.empty:
-        return
-    ev_map = dict(zip(events["title"], events["id"]))
-    ev_title = st.selectbox("Подія", list(ev_map.keys()), key="mentor_overview_event")
-    ev_id = ev_map[ev_title]
-    slots = query_df("""SELECT ms.id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
-                                ms.location, COALESCE(t.name,'—') AS team,
-                                CASE WHEN ms.is_booked=1 THEN 'заброньовано' ELSE 'вільно' END AS status
-                         FROM mentor_slots ms
-                         JOIN users u ON ms.mentor_id=u.id
-                         LEFT JOIN teams t ON ms.team_id=t.id
-                         WHERE ms.event_id=? ORDER BY ms.slot_date, ms.start_time""", (ev_id,))
-    if slots.empty:
-        st.info("Слотів для консультацій ще не створено.")
-    else:
-        st.dataframe(slots, use_container_width=True, hide_index=True)
+    # ---------------------------------------------------------------
+    # Статистика по менторах і подіях
+    # ---------------------------------------------------------------
+    with tab_stats:
+        events2 = get_events()
+        if events2.empty:
+            st.info("Немає даних для статистики.")
+        else:
+            ev_map2 = dict(zip(events2["title"], events2["id"]))
+            ev_title2 = st.selectbox("Подія", list(ev_map2.keys()), key="mentor_stats_event")
+            ev_id2 = ev_map2[ev_title2]
+
+            all_slots = query_df("""SELECT ms.mentor_id, u.full_name AS mentor, ms.is_booked
+                                     FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
+                                     WHERE ms.event_id=?""", (ev_id2,))
+            if all_slots.empty:
+                st.info("Слотів для цієї події ще не створено.")
+            else:
+                total = len(all_slots)
+                booked = int(all_slots["is_booked"].sum())
+                free = total - booked
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("Всього слотів", total)
+                sc2.metric("Заброньовано", booked)
+                sc3.metric("Вільно", free)
+                if total:
+                    st.progress(min(booked / total, 1.0))
+
+                st.markdown("#### Слотів на ментора")
+                per_mentor = all_slots.groupby("mentor").size()
+                st.bar_chart(per_mentor)
+
+                st.markdown("#### Заброньованих слотів на ментора")
+                booked_per_mentor = all_slots[all_slots["is_booked"] == 1].groupby("mentor").size()
+                if not booked_per_mentor.empty:
+                    st.bar_chart(booked_per_mentor)
+                else:
+                    st.caption("Заброньованих слотів поки немає.")
+
+                teams_without_slot = query_df("""SELECT t.id, t.name, t.faculty FROM teams t
+                                                  WHERE t.event_id=? AND t.status='Прийнято'
+                                                  AND t.id NOT IN (
+                                                      SELECT team_id FROM mentor_slots
+                                                      WHERE event_id=? AND team_id IS NOT NULL
+                                                  )""", (ev_id2, ev_id2))
+                st.markdown("#### Команди без запису на консультацію")
+                if teams_without_slot.empty:
+                    st.success("✅ Усі прийняті команди вже мають (або мали) запис на Office Hours.")
+                else:
+                    st.dataframe(teams_without_slot.rename(columns={"name": "Команда", "faculty": "Факультет"})
+                                 [["Команда", "Факультет"]], use_container_width=True, hide_index=True)
 
 
 def admin_analytics():
