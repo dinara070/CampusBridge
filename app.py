@@ -2389,6 +2389,14 @@ def admin_mentors():
                                  [["Команда", "Факультет"]], use_container_width=True, hide_index=True)
 
 
+def _parse_created_date(text):
+    """Витягує саму дату (без часу) з поля created_at (формат 'YYYY-MM-DD HH:MM:SS.ffffff')."""
+    if not text:
+        return None
+    dt = parse_date_flexible(str(text)[:19])
+    return dt.date() if dt else None
+
+
 def admin_analytics():
     st.subheader("📊 Аналітика та звіти")
     events = get_events()
@@ -2396,55 +2404,304 @@ def admin_analytics():
         st.info("Немає даних для аналітики.")
         return
 
-    total_teams = query_one("SELECT COUNT(*) FROM teams")[0]
-    total_members = query_one("SELECT COUNT(*) FROM team_members")[0]
-    total_events = len(events)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Всього подій", total_events)
-    c2.metric("Всього команд", total_teams)
-    c3.metric("Всього учасників", total_members)
+    tab_overview, tab_events, tab_people, tab_scoring, tab_export = st.tabs(
+        ["📈 Загальний огляд", "🏁 По подіях", "👥 Команди та факультети",
+         "⚖️ Оцінювання", "📤 Експорт звітів"])
 
-    teams_all = query_df("""SELECT t.*, e.title AS event_title FROM teams t
-                             JOIN events e ON t.event_id=e.id""")
-    if not teams_all.empty:
-        st.markdown("#### Розподіл команд за подіями")
-        st.bar_chart(teams_all.groupby("event_title").size())
+    teams_all = query_df("""SELECT t.*, e.title AS event_title, e.category AS event_category,
+                                    e.format AS event_format
+                             FROM teams t JOIN events e ON t.event_id=e.id""")
 
-        st.markdown("#### Розподіл за факультетами")
-        st.bar_chart(teams_all.groupby("faculty").size())
+    # ================================================================
+    # 📈 ЗАГАЛЬНИЙ ОГЛЯД
+    # ================================================================
+    with tab_overview:
+        total_teams = query_one("SELECT COUNT(*) FROM teams")[0]
+        total_members = query_one("SELECT COUNT(*) FROM team_members")[0]
+        total_events = len(events)
+        total_submissions = query_one("SELECT COUNT(DISTINCT team_id) FROM submissions")[0]
+        total_likes = query_one("SELECT COUNT(*) FROM showcase_likes")[0]
+        avg_team_size = round(total_members / total_teams, 1) if total_teams else 0
 
-        st.markdown("#### Розподіл за статусами заявок")
-        st.bar_chart(teams_all.groupby("status").size())
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Всього подій", total_events)
+        k2.metric("Всього команд", total_teams)
+        k3.metric("Всього учасників", total_members)
+        k4.metric("Сер. розмір команди", avg_team_size)
+        k5.metric("❤️ Лайків у портфоліо", total_likes)
 
-    st.markdown("#### Виявлені аномалії в оцінюванні")
-    ev_map = dict(zip(events["title"], events["id"]))
-    ev_title = st.selectbox("Подія для перевірки аномалій", list(ev_map.keys()), key="anomaly_event")
-    anomalies = detect_anomalies(ev_map[ev_title])
-    if anomalies.empty:
-        st.success("Аномалій не виявлено.")
-    else:
-        st.warning("Знайдено оцінки з суттєвим відхиленням від середнього — рекомендується перегляд.")
-        st.dataframe(anomalies, use_container_width=True, hide_index=True)
+        accepted_teams = int((teams_all["status"] == "Прийнято").sum()) if not teams_all.empty else 0
+        submission_rate = round(total_submissions / accepted_teams * 100, 1) if accepted_teams else 0
+        st.caption(f"📦 Подачі проєктів завантажили {total_submissions} із {accepted_teams} прийнятих команд "
+                   f"({submission_rate}%).")
 
-    st.markdown("#### Вивантаження звітів")
-    export_format = st.radio("Формат", ["CSV", "Excel"], horizontal=True)
-    if st.button("Сформувати звіт"):
-        events_df = query_df("SELECT * FROM events")
-        teams_df = query_df("SELECT * FROM teams")
-        scores_df = query_df("SELECT * FROM scores")
-        if export_format == "CSV":
-            buf = io.StringIO()
-            teams_df.to_csv(buf, index=False)
-            st.download_button("⬇️ Завантажити teams.csv", buf.getvalue(), file_name="teams.csv", mime="text/csv")
+        if not teams_all.empty:
+            st.markdown("#### 🗓️ Динаміка реєстрації команд у часі")
+            trend_df = teams_all.copy()
+            trend_df["Дата"] = trend_df["created_at"].apply(_parse_created_date)
+            trend_df = trend_df.dropna(subset=["Дата"])
+            if not trend_df.empty:
+                daily = trend_df.groupby("Дата").size().reset_index(name="Нових команд")
+                daily = daily.sort_values("Дата")
+                daily["Наростаючим підсумком"] = daily["Нових команд"].cumsum()
+                trend_long = daily.melt(id_vars="Дата", value_vars=["Нових команд", "Наростаючим підсумком"],
+                                         var_name="Показник", value_name="Кількість")
+                trend_chart = alt.Chart(trend_long).mark_line(point=True).encode(
+                    x=alt.X("Дата:T", title="Дата реєстрації"),
+                    y=alt.Y("Кількість:Q"),
+                    color=alt.Color("Показник:N", scale=alt.Scale(range=["#4F8BF9", "#27AE60"])),
+                    tooltip=["Дата:T", "Показник:N", "Кількість:Q"],
+                ).properties(height=300)
+                st.altair_chart(trend_chart, use_container_width=True)
+            else:
+                st.caption("Недостатньо даних для побудови динаміки.")
+
+            oc1, oc2 = st.columns(2)
+            with oc1:
+                st.markdown("#### 🏆 Команди за подіями")
+                by_event = teams_all.groupby("event_title").size().reset_index(name="Команд")
+                chart_ev = alt.Chart(by_event).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Команд:Q"),
+                    y=alt.Y("event_title:N", sort="-x", title="Подія"),
+                    color=alt.Color("Команд:Q", scale=alt.Scale(scheme="blues"), legend=None),
+                    tooltip=["event_title", "Команд"],
+                ).properties(height=max(160, 32 * len(by_event)))
+                st.altair_chart(chart_ev, use_container_width=True)
+            with oc2:
+                st.markdown("#### 🗂️ Розподіл за категоріями")
+                by_cat = teams_all.groupby("event_category").size().reset_index(name="Команд")
+                donut = alt.Chart(by_cat).mark_arc(innerRadius=60).encode(
+                    theta=alt.Theta("Команд:Q"),
+                    color=alt.Color("event_category:N", title="Категорія",
+                                     scale=alt.Scale(scheme="category10")),
+                    tooltip=["event_category", "Команд"],
+                ).properties(height=300)
+                st.altair_chart(donut, use_container_width=True)
+
+    # ================================================================
+    # 🏁 ПО ПОДІЯХ (deep dive для однієї події)
+    # ================================================================
+    with tab_events:
+        ev_map = dict(zip(events["title"], events["id"]))
+        ev_title_a = st.selectbox("Подія", list(ev_map.keys()), key="analytics_event_select")
+        ev_id_a = ev_map[ev_title_a]
+
+        ev_teams = query_df("SELECT * FROM teams WHERE event_id=?", (ev_id_a,))
+        n_teams = len(ev_teams)
+        n_accepted = int((ev_teams["status"] == "Прийнято").sum()) if n_teams else 0
+        n_members_ev = query_one("""SELECT COUNT(*) FROM team_members tm
+                                     JOIN teams t ON tm.team_id=t.id WHERE t.event_id=?""", (ev_id_a,))[0]
+        n_sub_ev = query_one("""SELECT COUNT(DISTINCT team_id) FROM submissions s
+                                 JOIN teams t ON s.team_id=t.id WHERE t.event_id=?""", (ev_id_a,))[0]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Команд подано", n_teams)
+        m2.metric("Прийнято", n_accepted)
+        m3.metric("Учасників", n_members_ev)
+        m4.metric("Із подачею проєкту", f"{n_sub_ev}/{n_accepted}" if n_accepted else n_sub_ev)
+
+        if n_teams:
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                st.markdown("#### 📋 Вирва статусів заявок")
+                status_counts = ev_teams.groupby("status").size().reindex(TEAM_STATUSES).fillna(0).reset_index()
+                status_counts.columns = ["Статус", "Команд"]
+                status_chart = alt.Chart(status_counts).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Статус:N", sort=TEAM_STATUSES),
+                    y=alt.Y("Команд:Q"),
+                    color=alt.Color("Статус:N", scale=alt.Scale(
+                        domain=TEAM_STATUSES,
+                        range=["#4F8BF9", "#27AE60", "#F1C40F", "#E74C3C"])),
+                    tooltip=["Статус", "Команд"],
+                ).properties(height=300)
+                st.altair_chart(status_chart, use_container_width=True)
+            with ec2:
+                noms_ev = query_df("SELECT id, name FROM nominations WHERE event_id=?", (ev_id_a,))
+                if not noms_ev.empty:
+                    st.markdown("#### 🏷️ Команди за номінаціями")
+                    nom_join = ev_teams.merge(noms_ev, left_on="nomination_id", right_on="id",
+                                               how="left", suffixes=("", "_nom"))
+                    nom_join["name"] = nom_join["name"].fillna("Без номінації")
+                    nom_counts = nom_join.groupby("name").size().reset_index(name="Команд")
+                    nom_donut = alt.Chart(nom_counts).mark_arc(innerRadius=55).encode(
+                        theta=alt.Theta("Команд:Q"),
+                        color=alt.Color("name:N", title="Номінація", scale=alt.Scale(scheme="set2")),
+                        tooltip=["name", "Команд"],
+                    ).properties(height=300)
+                    st.altair_chart(nom_donut, use_container_width=True)
+                else:
+                    st.markdown("#### 🎓 Команди за факультетами (ця подія)")
+                    fac_counts = ev_teams.groupby("faculty").size().reset_index(name="Команд")
+                    fac_chart = alt.Chart(fac_counts).mark_bar().encode(
+                        x=alt.X("Команд:Q"),
+                        y=alt.Y("faculty:N", sort="-x", title="Факультет"),
+                        color=alt.Color("Команд:Q", scale=alt.Scale(scheme="purples"), legend=None),
+                        tooltip=["faculty", "Команд"],
+                    ).properties(height=max(160, 32 * len(fac_counts)))
+                    st.altair_chart(fac_chart, use_container_width=True)
+
+            criteria_ev = query_df("SELECT * FROM criteria WHERE event_id=?", (ev_id_a,))
+            if not criteria_ev.empty:
+                st.markdown("#### 🎯 Середній бал за критеріями (ця подія)")
+                crit_rows = []
+                for _, crit in criteria_ev.iterrows():
+                    avg_row = query_one("""SELECT AVG(s.score) FROM scores s
+                                            JOIN teams t ON s.team_id=t.id
+                                            WHERE t.event_id=? AND s.criterion_id=?""", (ev_id_a, crit["id"]))
+                    if avg_row and avg_row[0] is not None:
+                        crit_rows.append({"Критерій": crit["name"], "Сер. бал": round(avg_row[0], 2),
+                                           "Максимум": crit["max_score"]})
+                if crit_rows:
+                    crit_df = pd.DataFrame(crit_rows)
+                    crit_chart = alt.Chart(crit_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                        x=alt.X("Критерій:N", sort="-y"),
+                        y=alt.Y("Сер. бал:Q"),
+                        color=alt.Color("Сер. бал:Q", scale=alt.Scale(scheme="goldgreen"), legend=None),
+                        tooltip=["Критерій", "Сер. бал", "Максимум"],
+                    ).properties(height=300)
+                    st.altair_chart(crit_chart, use_container_width=True)
+                else:
+                    st.caption("Оцінок для цієї події ще немає.")
         else:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                events_df.to_excel(writer, sheet_name="Events", index=False)
-                teams_df.to_excel(writer, sheet_name="Teams", index=False)
-                scores_df.to_excel(writer, sheet_name="Scores", index=False)
-            st.download_button("⬇️ Завантажити CampusBridge_report.xlsx", buf.getvalue(),
-                                file_name="CampusBridge_report.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.info("Для цієї події ще немає жодної команди.")
+
+    # ================================================================
+    # 👥 КОМАНДИ ТА ФАКУЛЬТЕТИ (загальний розподіл по всій платформі)
+    # ================================================================
+    with tab_people:
+        if teams_all.empty:
+            st.info("Команд ще немає.")
+        else:
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                st.markdown("#### 🎓 Розподіл команд за факультетами")
+                fac_all = teams_all.groupby("faculty").size().reset_index(name="Команд")
+                fac_chart_all = alt.Chart(fac_all).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Команд:Q"),
+                    y=alt.Y("faculty:N", sort="-x", title="Факультет"),
+                    color=alt.Color("Команд:Q", scale=alt.Scale(scheme="teals"), legend=None),
+                    tooltip=["faculty", "Команд"],
+                ).properties(height=max(200, 32 * len(fac_all)))
+                st.altair_chart(fac_chart_all, use_container_width=True)
+            with pc2:
+                st.markdown("#### 📥 Розподіл за статусами заявок (усі події)")
+                status_all = teams_all.groupby("status").size().reindex(TEAM_STATUSES).fillna(0).reset_index()
+                status_all.columns = ["Статус", "Команд"]
+                status_donut_all = alt.Chart(status_all).mark_arc(innerRadius=60).encode(
+                    theta=alt.Theta("Команд:Q"),
+                    color=alt.Color("Статус:N", scale=alt.Scale(
+                        domain=TEAM_STATUSES,
+                        range=["#4F8BF9", "#27AE60", "#F1C40F", "#E74C3C"])),
+                    tooltip=["Статус", "Команд"],
+                ).properties(height=320)
+                st.altair_chart(status_donut_all, use_container_width=True)
+
+            st.markdown("#### 📐 Розподіл команд за розміром")
+            size_df = query_df("""SELECT tm.team_id, COUNT(*) AS members FROM team_members tm GROUP BY tm.team_id""")
+            if not size_df.empty:
+                size_hist = alt.Chart(size_df).mark_bar().encode(
+                    x=alt.X("members:O", title="Кількість учасників у команді"),
+                    y=alt.Y("count():Q", title="Кількість команд"),
+                    color=alt.Color("members:O", scale=alt.Scale(scheme="oranges"), legend=None),
+                    tooltip=["members", "count()"],
+                ).properties(height=280)
+                st.altair_chart(size_hist, use_container_width=True)
+            else:
+                st.caption("Ще немає команд зі складом учасників.")
+
+            st.markdown("#### 🖥️ Розподіл подій за форматом")
+            fmt_all = teams_all.groupby("event_format").size().reset_index(name="Команд")
+            fmt_chart = alt.Chart(fmt_all).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("event_format:N", title="Формат"),
+                y=alt.Y("Команд:Q"),
+                color=alt.Color("event_format:N", scale=alt.Scale(scheme="dark2"), legend=None),
+                tooltip=["event_format", "Команд"],
+            ).properties(height=280)
+            st.altair_chart(fmt_chart, use_container_width=True)
+
+    # ================================================================
+    # ⚖️ ОЦІНЮВАННЯ (аномалії + активність журі)
+    # ================================================================
+    with tab_scoring:
+        st.markdown("#### ⚠️ Виявлені аномалії в оцінюванні")
+        ev_map2 = dict(zip(events["title"], events["id"]))
+        ev_title2 = st.selectbox("Подія для перевірки аномалій", list(ev_map2.keys()), key="anomaly_event")
+        anomalies = detect_anomalies(ev_map2[ev_title2])
+        if anomalies.empty:
+            st.success("Аномалій не виявлено.")
+        else:
+            st.warning("Знайдено оцінки з суттєвим відхиленням від середнього — рекомендується перегляд.")
+            st.dataframe(anomalies, use_container_width=True, hide_index=True)
+            anomaly_chart = alt.Chart(anomalies).mark_circle(size=120).encode(
+                x=alt.X("Команда:N"),
+                y=alt.Y("Відхилення:Q"),
+                color=alt.Color("Журі:N", scale=alt.Scale(scheme="category10")),
+                tooltip=["Команда", "Критерій", "Журі", "Оцінка", "Середнє", "Відхилення"],
+            ).properties(height=300)
+            st.altair_chart(anomaly_chart, use_container_width=True)
+
+        st.markdown("#### 👩‍⚖️ Активність журі (кількість виставлених оцінок)")
+        jury_activity = query_df("""SELECT u.full_name AS jury, COUNT(*) AS scores
+                                     FROM scores s JOIN users u ON s.jury_id=u.id
+                                     GROUP BY u.full_name ORDER BY scores DESC""")
+        if jury_activity.empty:
+            st.caption("Оцінок ще немає.")
+        else:
+            jury_chart = alt.Chart(jury_activity).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("scores:Q", title="Виставлено оцінок"),
+                y=alt.Y("jury:N", sort="-x", title="Журі"),
+                color=alt.Color("scores:Q", scale=alt.Scale(scheme="greens"), legend=None),
+                tooltip=["jury", "scores"],
+            ).properties(height=max(160, 32 * len(jury_activity)))
+            st.altair_chart(jury_chart, use_container_width=True)
+
+        st.markdown("#### 📊 Загальний розподіл усіх виставлених оцінок")
+        all_scores_global = query_df("SELECT score FROM scores")
+        if all_scores_global.empty:
+            st.caption("Оцінок ще немає.")
+        else:
+            global_hist = alt.Chart(all_scores_global).mark_bar().encode(
+                x=alt.X("score:Q", bin=alt.Bin(maxbins=20), title="Оцінка"),
+                y=alt.Y("count():Q", title="Кількість"),
+                color=alt.value("#4F8BF9"),
+                tooltip=["count()"],
+            ).properties(height=280)
+            st.altair_chart(global_hist, use_container_width=True)
+
+    # ================================================================
+    # 📤 ЕКСПОРТ ЗВІТІВ
+    # ================================================================
+    with tab_export:
+        st.markdown("#### Вивантаження зведеного звіту")
+        st.caption("Excel-звіт містить окремі аркуші з подіями, командами, учасниками, оцінками, "
+                   "критеріями, номінаціями та слотами Office Hours.")
+        export_format = st.radio("Формат", ["CSV (лише команди)", "Excel (повний звіт)"], horizontal=True)
+        if st.button("Сформувати звіт"):
+            events_df = query_df("SELECT * FROM events")
+            teams_df = query_df("SELECT * FROM teams")
+            scores_df = query_df("SELECT * FROM scores")
+            if export_format == "CSV (лише команди)":
+                buf = io.StringIO()
+                teams_df.to_csv(buf, index=False)
+                st.download_button("⬇️ Завантажити teams.csv", buf.getvalue(), file_name="teams.csv", mime="text/csv")
+            else:
+                members_df = query_df("""SELECT tm.team_id, u.full_name, u.email, u.faculty
+                                          FROM team_members tm JOIN users u ON tm.user_id=u.id""")
+                criteria_df = query_df("SELECT * FROM criteria")
+                nominations_df = query_df("SELECT * FROM nominations")
+                mentor_slots_df = query_df("SELECT * FROM mentor_slots")
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    events_df.to_excel(writer, sheet_name="Events", index=False)
+                    teams_df.to_excel(writer, sheet_name="Teams", index=False)
+                    members_df.to_excel(writer, sheet_name="Team_Members", index=False)
+                    scores_df.to_excel(writer, sheet_name="Scores", index=False)
+                    criteria_df.to_excel(writer, sheet_name="Criteria", index=False)
+                    nominations_df.to_excel(writer, sheet_name="Nominations", index=False)
+                    mentor_slots_df.to_excel(writer, sheet_name="Mentor_Slots", index=False)
+                st.download_button("⬇️ Завантажити CampusBridge_report.xlsx", buf.getvalue(),
+                                    file_name="CampusBridge_report.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def admin_announcements():
