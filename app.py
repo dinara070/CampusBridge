@@ -2953,81 +2953,299 @@ def admin_announcements():
                 st.dataframe(pd.DataFrame(reach_rows), use_container_width=True, hide_index=True)
 
 
+EXPORT_TABLES = ["events", "teams", "team_members", "users", "scores", "criteria", "nominations",
+                  "submissions", "files", "mentor_slots", "announcements", "showcase_likes",
+                  "email_log", "team_status_log"]
+
+
+def get_exportable_df(table_name):
+    """Повертає DataFrame таблиці для експорту, приховуючи чутливі/важкі поля."""
+    if table_name == "users":
+        return query_df("""SELECT id, username, role, full_name, email, university, faculty, created_at
+                            FROM users""")
+    if table_name == "files":
+        return query_df("SELECT id, submission_id, filename, mimetype, uploaded_at FROM files")
+    return query_df(f"SELECT * FROM {table_name}")
+
+
+def _df_to_csv_bytes(df):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
+def _dfs_to_excel_bytes(sheets: dict):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, index=False, sheet_name=name[:31])
+    return buf.getvalue()
+
+
 def admin_import_export():
     st.subheader("📤 Імпорт / Експорт даних")
+    tab_export, tab_import, tab_backup = st.tabs(
+        ["📥 Експорт", "📤 Імпорт", "🗄️ Резервне копіювання"])
 
-    st.markdown("#### Експорт")
-    table_choice = st.selectbox("Таблиця для експорту", ["events", "teams", "users", "scores", "submissions"])
-    df = query_df(f"SELECT * FROM {table_choice}")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        buf_csv = io.StringIO()
-        df.to_csv(buf_csv, index=False)
-        st.download_button(f"⬇️ {table_choice}.csv", buf_csv.getvalue(), file_name=f"{table_choice}.csv", mime="text/csv")
-    with col2:
-        buf_xlsx = io.BytesIO()
-        with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name=table_choice[:31])
-        st.download_button(f"⬇️ {table_choice}.xlsx", buf_xlsx.getvalue(), file_name=f"{table_choice}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # ================================================================
+    # 📥 ЕКСПОРТ
+    # ================================================================
+    with tab_export:
+        st.markdown("#### Експорт однієї таблиці")
+        table_choice = st.selectbox("Таблиця для експорту", EXPORT_TABLES)
+        df = get_exportable_df(table_choice)
+        st.caption(f"Рядків: {len(df)}")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(f"⬇️ {table_choice}.csv", _df_to_csv_bytes(df),
+                                file_name=f"{table_choice}.csv", mime="text/csv")
+        with col2:
+            st.download_button(f"⬇️ {table_choice}.xlsx", _dfs_to_excel_bytes({table_choice: df}),
+                                file_name=f"{table_choice}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.markdown("---")
-    st.markdown("#### Імпорт команд (масове попереднє додавання)")
-    st.caption("Очікувані колонки: event_id, name, faculty, status (необов'язково)")
-    up = st.file_uploader("Завантажте CSV або Excel файл із командами", type=["csv", "xlsx"], key="import_teams")
-    if up is not None:
-        try:
-            if up.name.endswith(".csv"):
-                imp_df = pd.read_csv(up)
-            else:
-                imp_df = pd.read_excel(up)
-            st.dataframe(imp_df, use_container_width=True, hide_index=True)
-            if st.button("Підтвердити імпорт команд"):
-                count = 0
-                affected_events = set()
-                for _, r in imp_df.iterrows():
-                    ev_id_val = int(r.get("event_id"))
-                    execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
-                               faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (ev_id_val, None, r.get("name"), None, gen_code(),
-                             r.get("faculty", ""), r.get("status", "На розгляді"), "", now()))
-                    affected_events.add(ev_id_val)
-                    count += 1
-                for eid in affected_events:
-                    maybe_autoclose_registration(eid)
-                st.success(f"Імпортовано {count} команд(и).")
-        except Exception as e:
-            st.error(f"Помилка обробки файлу: {e}")
+        st.markdown("---")
+        st.markdown("#### 🗄️ Повний бекап у Excel (усі таблиці одразу)")
+        st.caption("Один файл із окремим аркушем на кожну таблицю платформи (без паролів і без бінарних файлів презентацій).")
+        if st.button("Сформувати повний Excel-бекап"):
+            sheets = {t: get_exportable_df(t) for t in EXPORT_TABLES}
+            data = _dfs_to_excel_bytes(sheets)
+            st.download_button("⬇️ Завантажити CampusBridge_full_backup.xlsx", data,
+                                file_name=f"CampusBridge_full_backup_{datetime.date.today()}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="full_backup_dl")
 
-    st.markdown("#### Імпорт подій (масове створення)")
-    st.caption("Очікувані колонки: title, category, format, description, status, "
-               "reg_start, reg_end, event_start, pitch_deadline, prize_fund, banner_url, video_url (необов'язково)")
-    up2 = st.file_uploader("Завантажте CSV або Excel файл із подіями", type=["csv", "xlsx"], key="import_events")
-    if up2 is not None:
-        try:
-            if up2.name.endswith(".csv"):
-                imp_df2 = pd.read_csv(up2)
-            else:
-                imp_df2 = pd.read_excel(up2)
-            st.dataframe(imp_df2, use_container_width=True, hide_index=True)
-            if st.button("Підтвердити імпорт подій"):
-                count = 0
-                for _, r in imp_df2.iterrows():
-                    execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
-                               event_start,pitch_deadline,min_team,max_team,prize_fund,status,leaderboard_live,
-                               avoid_conflict,university,faculty,created_by,created_at,double_blind,banner_url,video_url)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (r.get("title"), r.get("category", "IT"), r.get("format", "Онлайн"),
-                             r.get("description", ""), "", r.get("reg_start", ""), r.get("reg_end", ""),
-                             r.get("event_start", ""), r.get("pitch_deadline", ""), 2, 5,
-                             r.get("prize_fund", ""), r.get("status", "Чернетка"),
-                             0, 1, MAIN_UNIVERSITY, MAIN_FACULTY, st.session_state.user["id"], now(), 0,
-                             r.get("banner_url", ""), r.get("video_url", "")))
-                    count += 1
-                st.success(f"Імпортовано {count} подій(ї).")
-        except Exception as e:
-            st.error(f"Помилка обробки файлу: {e}")
+        st.markdown("---")
+        st.markdown("#### 🎯 Пакетний експорт по одній події")
+        st.caption("Усі дані, пов'язані з обраною подією (команди, учасники, подачі, оцінки, критерії, "
+                   "номінації, слоти консультацій) — в один Excel-файл.")
+        events_exp = get_events()
+        if events_exp.empty:
+            st.info("Подій ще немає.")
+        else:
+            ev_map_exp = dict(zip(events_exp["title"], events_exp["id"]))
+            ev_title_exp = st.selectbox("Подія", list(ev_map_exp.keys()), key="export_event_select")
+            ev_id_exp = ev_map_exp[ev_title_exp]
+            if st.button("Сформувати пакет по події"):
+                ev_df = query_df("SELECT * FROM events WHERE id=?", (ev_id_exp,))
+                teams_df = query_df("SELECT * FROM teams WHERE event_id=?", (ev_id_exp,))
+                members_df = query_df("""SELECT tm.team_id, u.full_name, u.email, u.faculty
+                                          FROM team_members tm JOIN teams t ON tm.team_id=t.id
+                                          JOIN users u ON tm.user_id=u.id WHERE t.event_id=?""", (ev_id_exp,))
+                submissions_df = query_df("""SELECT s.* FROM submissions s
+                                              JOIN teams t ON s.team_id=t.id WHERE t.event_id=?""", (ev_id_exp,))
+                scores_df = query_df("""SELECT s.* FROM scores s
+                                         JOIN teams t ON s.team_id=t.id WHERE t.event_id=?""", (ev_id_exp,))
+                criteria_df = query_df("SELECT * FROM criteria WHERE event_id=?", (ev_id_exp,))
+                nominations_df = query_df("SELECT * FROM nominations WHERE event_id=?", (ev_id_exp,))
+                mentor_slots_df = query_df("SELECT * FROM mentor_slots WHERE event_id=?", (ev_id_exp,))
+                package = {
+                    "Event": ev_df, "Teams": teams_df, "Team_Members": members_df,
+                    "Submissions": submissions_df, "Scores": scores_df, "Criteria": criteria_df,
+                    "Nominations": nominations_df, "Mentor_Slots": mentor_slots_df,
+                }
+                data_pkg = _dfs_to_excel_bytes(package)
+                safe_title = "".join(ch if ch.isalnum() else "_" for ch in ev_title_exp)[:40]
+                st.download_button(f"⬇️ Завантажити {safe_title}.xlsx", data_pkg,
+                                    file_name=f"{safe_title}_export.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="event_package_dl")
+
+    # ================================================================
+    # 📤 ІМПОРТ
+    # ================================================================
+    with tab_import:
+        st.markdown("#### Імпорт команд (масове попереднє додавання)")
+        st.caption("Очікувані колонки: `event_id`, `name`, `faculty`, `status` (необов'язково).")
+        st.download_button("📄 Завантажити шаблон teams_template.csv",
+                            _df_to_csv_bytes(pd.DataFrame([{"event_id": 1, "name": "Приклад Команди",
+                                                             "faculty": MAIN_FACULTY, "status": "На розгляді"}])),
+                            file_name="teams_template.csv", mime="text/csv", key="tmpl_teams")
+        up = st.file_uploader("Завантажте CSV або Excel файл із командами", type=["csv", "xlsx"], key="import_teams")
+        if up is not None:
+            try:
+                imp_df = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+                missing_cols = {"event_id", "name"} - set(imp_df.columns)
+                if missing_cols:
+                    st.error(f"У файлі бракує обов'язкових колонок: {', '.join(missing_cols)}")
+                else:
+                    valid_event_ids = set(query_df("SELECT id FROM events")["id"].tolist())
+                    bad_rows = imp_df[~imp_df["event_id"].isin(valid_event_ids)]
+                    if not bad_rows.empty:
+                        st.warning(f"⚠️ {len(bad_rows)} рядк(ів) посилаються на неіснуючий event_id і будуть пропущені "
+                                   f"при імпорті: {sorted(bad_rows['event_id'].unique().tolist())}")
+                    st.dataframe(imp_df, use_container_width=True, hide_index=True)
+                    if st.button("Підтвердити імпорт команд"):
+                        count, skipped = 0, 0
+                        affected_events = set()
+                        for _, r in imp_df.iterrows():
+                            if r.get("event_id") not in valid_event_ids or not r.get("name"):
+                                skipped += 1
+                                continue
+                            ev_id_val = int(r.get("event_id"))
+                            execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
+                                       faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                                    (ev_id_val, None, r.get("name"), None, gen_code(),
+                                     r.get("faculty", ""), r.get("status", "На розгляді"), "", now()))
+                            affected_events.add(ev_id_val)
+                            count += 1
+                        for eid in affected_events:
+                            maybe_autoclose_registration(eid)
+                        st.success(f"Імпортовано {count} команд(и)." + (f" Пропущено: {skipped}." if skipped else ""))
+            except Exception as e:
+                st.error(f"Помилка обробки файлу: {e}")
+
+        st.markdown("---")
+        st.markdown("#### Імпорт подій (масове створення)")
+        st.caption("Очікувані колонки: `title` (обов'язково), `category`, `format`, `description`, `status`, "
+                   "`reg_start`, `reg_end`, `event_start`, `pitch_deadline`, `prize_fund`, `banner_url`, `video_url`.")
+        st.download_button("📄 Завантажити шаблон events_template.csv",
+                            _df_to_csv_bytes(pd.DataFrame([{
+                                "title": "Приклад Хакатону", "category": "IT", "format": "Онлайн",
+                                "description": "", "status": "Чернетка", "reg_start": "2026-10-01",
+                                "reg_end": "2026-10-15", "event_start": "2026-10-20", "pitch_deadline": "2026-10-22",
+                                "prize_fund": "10 000 грн", "banner_url": "", "video_url": ""}])),
+                            file_name="events_template.csv", mime="text/csv", key="tmpl_events")
+        up2 = st.file_uploader("Завантажте CSV або Excel файл із подіями", type=["csv", "xlsx"], key="import_events")
+        if up2 is not None:
+            try:
+                imp_df2 = pd.read_csv(up2) if up2.name.endswith(".csv") else pd.read_excel(up2)
+                if "title" not in imp_df2.columns:
+                    st.error("У файлі бракує обов'язкової колонки `title`.")
+                else:
+                    st.dataframe(imp_df2, use_container_width=True, hide_index=True)
+                    if st.button("Підтвердити імпорт подій"):
+                        count, skipped = 0, 0
+                        for _, r in imp_df2.iterrows():
+                            if not r.get("title"):
+                                skipped += 1
+                                continue
+                            execute("""INSERT INTO events (title,category,format,description,regulations,reg_start,reg_end,
+                                       event_start,pitch_deadline,min_team,max_team,prize_fund,status,leaderboard_live,
+                                       avoid_conflict,university,faculty,created_by,created_at,double_blind,banner_url,video_url)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (r.get("title"), r.get("category", "IT"), r.get("format", "Онлайн"),
+                                     r.get("description", ""), "", r.get("reg_start", ""), r.get("reg_end", ""),
+                                     r.get("event_start", ""), r.get("pitch_deadline", ""), 2, 5,
+                                     r.get("prize_fund", ""), r.get("status", "Чернетка"),
+                                     0, 1, MAIN_UNIVERSITY, MAIN_FACULTY, st.session_state.user["id"], now(), 0,
+                                     r.get("banner_url", ""), r.get("video_url", "")))
+                            count += 1
+                        st.success(f"Імпортовано {count} подій(ї)." + (f" Пропущено: {skipped}." if skipped else ""))
+            except Exception as e:
+                st.error(f"Помилка обробки файлу: {e}")
+
+        st.markdown("---")
+        st.markdown("#### Імпорт критеріїв оцінювання")
+        st.caption("Очікувані колонки: `event_id`, `name`, `weight` (%), `max_score`.")
+        st.download_button("📄 Завантажити шаблон criteria_template.csv",
+                            _df_to_csv_bytes(pd.DataFrame([{"event_id": 1, "name": "Інноваційність",
+                                                             "weight": 30, "max_score": 10}])),
+                            file_name="criteria_template.csv", mime="text/csv", key="tmpl_criteria")
+        up3 = st.file_uploader("Завантажте CSV або Excel файл із критеріями", type=["csv", "xlsx"], key="import_criteria")
+        if up3 is not None:
+            try:
+                imp_df3 = pd.read_csv(up3) if up3.name.endswith(".csv") else pd.read_excel(up3)
+                missing3 = {"event_id", "name", "weight", "max_score"} - set(imp_df3.columns)
+                if missing3:
+                    st.error(f"У файлі бракує обов'язкових колонок: {', '.join(missing3)}")
+                else:
+                    valid_event_ids3 = set(query_df("SELECT id FROM events")["id"].tolist())
+                    st.dataframe(imp_df3, use_container_width=True, hide_index=True)
+                    if st.button("Підтвердити імпорт критеріїв"):
+                        count, skipped = 0, 0
+                        for _, r in imp_df3.iterrows():
+                            if r.get("event_id") not in valid_event_ids3:
+                                skipped += 1
+                                continue
+                            execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
+                                    (int(r.get("event_id")), r.get("name"), float(r.get("weight")), float(r.get("max_score"))))
+                            count += 1
+                        st.success(f"Імпортовано {count} критеріїв." + (f" Пропущено: {skipped}." if skipped else ""))
+            except Exception as e:
+                st.error(f"Помилка обробки файлу: {e}")
+
+        st.markdown("---")
+        st.markdown("#### Імпорт номінацій")
+        st.caption("Очікувані колонки: `event_id`, `name`.")
+        st.download_button("📄 Завантажити шаблон nominations_template.csv",
+                            _df_to_csv_bytes(pd.DataFrame([{"event_id": 1, "name": "AI / Machine Learning"}])),
+                            file_name="nominations_template.csv", mime="text/csv", key="tmpl_noms")
+        up4 = st.file_uploader("Завантажте CSV або Excel файл із номінаціями", type=["csv", "xlsx"], key="import_noms")
+        if up4 is not None:
+            try:
+                imp_df4 = pd.read_csv(up4) if up4.name.endswith(".csv") else pd.read_excel(up4)
+                missing4 = {"event_id", "name"} - set(imp_df4.columns)
+                if missing4:
+                    st.error(f"У файлі бракує обов'язкових колонок: {', '.join(missing4)}")
+                else:
+                    valid_event_ids4 = set(query_df("SELECT id FROM events")["id"].tolist())
+                    st.dataframe(imp_df4, use_container_width=True, hide_index=True)
+                    if st.button("Підтвердити імпорт номінацій"):
+                        count, skipped = 0, 0
+                        for _, r in imp_df4.iterrows():
+                            if r.get("event_id") not in valid_event_ids4 or not r.get("name"):
+                                skipped += 1
+                                continue
+                            execute("INSERT INTO nominations (event_id, name) VALUES (?,?)",
+                                    (int(r.get("event_id")), r.get("name")))
+                            count += 1
+                        st.success(f"Імпортовано {count} номінацій." + (f" Пропущено: {skipped}." if skipped else ""))
+            except Exception as e:
+                st.error(f"Помилка обробки файлу: {e}")
+
+    # ================================================================
+    # 🗄️ РЕЗЕРВНЕ КОПІЮВАННЯ
+    # ================================================================
+    with tab_backup:
+        st.markdown("#### 📦 Стан бази даних")
+        db_size_mb = round(os.path.getsize(DB_PATH) / (1024 * 1024), 2) if os.path.exists(DB_PATH) else 0
+        row_counts = []
+        for t in ["events", "teams", "team_members", "users", "scores", "submissions", "files",
+                  "mentor_slots", "announcements", "showcase_likes", "email_log"]:
+            n = query_one(f"SELECT COUNT(*) FROM {t}")[0]
+            row_counts.append({"Таблиця": t, "Рядків": n})
+        bc1, bc2 = st.columns([1, 2])
+        with bc1:
+            st.metric("Розмір файлу БД", f"{db_size_mb} МБ")
+        with bc2:
+            st.dataframe(pd.DataFrame(row_counts), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### ⬇️ Завантажити повну резервну копію (.db)")
+        st.caption("Файл SQLite з усіма даними платформи (включно з бінарними презентаціями). "
+                   "Зберігайте його в надійному місці — він містить хеші паролів усіх користувачів.")
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, "rb") as f:
+                db_bytes = f.read()
+            st.download_button("⬇️ Завантажити campusbridge_backup.db", db_bytes,
+                                file_name=f"campusbridge_backup_{datetime.date.today()}.db",
+                                mime="application/octet-stream")
+        else:
+            st.warning("Файл бази даних не знайдено.")
+
+        st.markdown("---")
+        with st.expander("⚠️ Небезпечна зона: відновлення з резервної копії"):
+            st.error("Ця дія повністю замінить поточну базу даних платформи завантаженим файлом. "
+                     "Усі поточні дані (події, команди, оцінки тощо) будуть безповоротно втрачені, "
+                     "якщо ви не зробили власний бекап заздалегідь.")
+            restore_file = st.file_uploader("Файл резервної копії (.db)", type=["db"], key="restore_db")
+            confirm_text = st.text_input("Для підтвердження введіть слово: ПІДТВЕРДЖУЮ")
+            confirm_checkbox = st.checkbox("Я розумію наслідки та маю власний бекап поточних даних")
+            if st.button("🗄️ Відновити базу даних з файлу", type="primary"):
+                if restore_file is None:
+                    st.error("Спочатку завантажте .db файл.")
+                elif confirm_text.strip() != "ПІДТВЕРДЖУЮ" or not confirm_checkbox:
+                    st.error("Підтвердіть дію: введіть слово ПІДТВЕРДЖУЮ та встановіть позначку вище.")
+                else:
+                    try:
+                        with open(DB_PATH, "wb") as f:
+                            f.write(restore_file.getvalue())
+                        st.success("Базу даних відновлено з резервної копії. Перезавантажте сторінку.")
+                        logout()
+                    except Exception as e:
+                        st.error(f"Не вдалося відновити базу даних: {e}")
 
 
 def page_admin():
