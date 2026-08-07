@@ -271,6 +271,18 @@ def init_db():
         c.execute("ALTER TABLE submissions ADD COLUMN tags TEXT")
     conn.commit()
 
+    c.execute("PRAGMA table_info(announcements)")
+    ann_cols = [row[1] for row in c.fetchall()]
+    if "priority" not in ann_cols:
+        c.execute("ALTER TABLE announcements ADD COLUMN priority TEXT DEFAULT 'Звичайне'")
+    if "audience" not in ann_cols:
+        c.execute("ALTER TABLE announcements ADD COLUMN audience TEXT DEFAULT 'Усі'")
+    if "created_by_name" not in ann_cols:
+        c.execute("ALTER TABLE announcements ADD COLUMN created_by_name TEXT")
+    if "email_status" not in ann_cols:
+        c.execute("ALTER TABLE announcements ADD COLUMN email_status TEXT")
+    conn.commit()
+
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
     if c.fetchone()[0] == 0:
         c.execute("""INSERT INTO users
@@ -908,6 +920,56 @@ def apply_team_status_change(team_id, new_status, comment):
     if old_status != new_status:
         email_result = send_status_email(team_id, new_status, comment)
     return old_status, email_result
+
+
+def send_announcement_email(team_id, ann_title, ann_body):
+    """Надсилає (або симулює) email-дублікат оголошення капітану команди.
+    Повертає 'sent' / 'simulated' / 'failed: ...' / None (якщо надсилати нікому)."""
+    team = query_one("""SELECT t.name, t.captain_id, e.title FROM teams t
+                         JOIN events e ON t.event_id = e.id WHERE t.id=?""", (team_id,))
+    if not team:
+        return None
+    team_name, captain_id, event_title = team
+    if not captain_id:
+        return None  # команда без капітана — надсилати нікому
+
+    captain = query_one("SELECT full_name, email FROM users WHERE id=?", (captain_id,))
+    if not captain or not captain[1]:
+        return None
+    captain_name, to_email = captain
+
+    subject = f"📢 {ann_title} — {event_title}"
+    body_lines = [f"Вітаємо, {captain_name}!", "", ann_body or "",
+                  "", f"Команда: {team_name} · Подія: {event_title}",
+                  "", "Це оголошення також опубліковано в особистому кабінеті на платформі CampusBridge.",
+                  "", f"— CampusBridge, {MAIN_UNIVERSITY}"]
+    body = "\n".join(body_lines)
+
+    status_result = "simulated"
+    smtp_cfg = get_smtp_config()
+    if smtp_cfg:
+        try:
+            msg = MIMEText(body, _charset="utf-8")
+            msg["Subject"] = subject
+            from_email = smtp_cfg.get("from_email") or smtp_cfg.get("username", "")
+            msg["From"] = from_email
+            msg["To"] = to_email
+            host = smtp_cfg["host"]
+            port = int(smtp_cfg.get("port", 587))
+            use_tls = bool(smtp_cfg.get("use_tls", True))
+            with smtplib.SMTP(host, port, timeout=10) as server:
+                if use_tls:
+                    server.starttls()
+                if smtp_cfg.get("username"):
+                    server.login(smtp_cfg["username"], smtp_cfg.get("password", ""))
+                server.sendmail(from_email, [to_email], msg.as_string())
+            status_result = "sent"
+        except Exception as e:
+            status_result = f"failed: {e}"
+
+    execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+               VALUES (?,?,?,?,?,?)""", (team_id, to_email, subject, body, status_result, now()))
+    return status_result
 
 
 def get_email_log_for_event(event_id):
@@ -2706,35 +2768,189 @@ def admin_analytics():
 
 def admin_announcements():
     st.subheader("📢 Сповіщення та розсилки")
+    tab_new, tab_history, tab_stats = st.tabs(
+        ["✉️ Нове оголошення", "🗂️ Історія та керування", "📊 Огляд охоплення"])
+
     events = get_events()
     ev_map = {"— глобальне (усі учасники) —": None}
     ev_map.update(dict(zip(events["title"], events["id"])) if not events.empty else {})
 
-    with st.form("announce_form"):
-        ev_title = st.selectbox("Подія", list(ev_map.keys()))
-        ev_id = ev_map[ev_title]
-        target_team_id = None
-        if ev_id:
-            teams = query_df("SELECT id, name FROM teams WHERE event_id=?", (ev_id,))
-            tmap = {"— всі команди події —": None}
-            tmap.update(dict(zip(teams["name"], teams["id"])) if not teams.empty else {})
-            tname = st.selectbox("Отримувач", list(tmap.keys()))
-            target_team_id = tmap[tname]
-        title = st.text_input("Заголовок")
-        body = st.text_area("Текст повідомлення")
-        if st.form_submit_button("Надіслати") and title:
-            execute("INSERT INTO announcements (event_id,title,body,target_team_id,created_at) VALUES (?,?,?,?,?)",
-                    (ev_id, title, body, target_team_id, now()))
-            st.success("Оголошення опубліковано.")
+    AUDIENCE_STATUS_MAP = {
+        "Усі команди": None, "Лише «Прийнято»": "Прийнято",
+        "Лише «На розгляді»": "На розгляді",
+        "Лише «Потребує доопрацювання»": "Потребує доопрацювання",
+    }
 
-    st.markdown("#### Історія оголошень")
-    hist = query_df("""SELECT a.created_at, COALESCE(e.title,'Глобальне') AS event,
-                               COALESCE(t.name,'Усі команди') AS target, a.title, a.body
-                        FROM announcements a
-                        LEFT JOIN events e ON a.event_id=e.id
-                        LEFT JOIN teams t ON a.target_team_id=t.id
-                        ORDER BY a.created_at DESC""")
-    st.dataframe(hist, use_container_width=True, hide_index=True)
+    # ================================================================
+    # ✉️ НОВЕ ОГОЛОШЕННЯ
+    # ================================================================
+    with tab_new:
+        with st.form("announce_form"):
+            ev_title = st.selectbox("Подія", list(ev_map.keys()), key="ann_event_select")
+            ev_id = ev_map[ev_title]
+
+            target_team_id = None
+            audience_label = "Усі"
+            teams = pd.DataFrame()
+            if ev_id:
+                teams = query_df("SELECT id, name, status, captain_id FROM teams WHERE event_id=?", (ev_id,))
+                tmap = {"— всі команди події —": None}
+                tmap.update(dict(zip(teams["name"], teams["id"])) if not teams.empty else {})
+                tname = st.selectbox("Отримувач", list(tmap.keys()))
+                target_team_id = tmap[tname]
+
+                if target_team_id is None and not teams.empty:
+                    audience_label = st.selectbox(
+                        "Фільтр аудиторії (звужує коло команд для email-дублювання й статистики)",
+                        list(AUDIENCE_STATUS_MAP.keys()))
+                else:
+                    audience_label = "Конкретна команда" if target_team_id else "Усі"
+
+            priority = st.radio("Пріоритет", ["Звичайне", "⭐ Важливе"], horizontal=True)
+            title = st.text_input("Заголовок")
+            body = st.text_area("Текст повідомлення")
+
+            send_email_copy = False
+            if ev_id:
+                send_email_copy = st.checkbox(
+                    "📧 Також продублювати капітанам на email",
+                    help="Реально надішле лист, якщо в secrets.toml налаштовано SMTP; "
+                         "інакше надсилання симулюється й фіксується в журналі email.")
+
+            submitted = st.form_submit_button("📢 Опублікувати")
+            if submitted:
+                if not title:
+                    st.error("Вкажіть заголовок оголошення.")
+                else:
+                    user = st.session_state.user
+                    new_ann_id = execute(
+                        """INSERT INTO announcements (event_id,title,body,target_team_id,created_at,
+                           priority,audience,created_by_name,email_status)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (ev_id, title, body, target_team_id, now(), priority, audience_label,
+                         user["full_name"], None))
+
+                    email_summary = None
+                    if send_email_copy and ev_id:
+                        if target_team_id:
+                            target_ids = [target_team_id]
+                        else:
+                            wanted_status = AUDIENCE_STATUS_MAP.get(audience_label)
+                            df_targets = teams if wanted_status is None else teams[teams["status"] == wanted_status]
+                            target_ids = df_targets["id"].tolist()
+
+                        results = [send_announcement_email(int(tid), title, body) for tid in target_ids]
+                        results = [r for r in results if r]
+                        sent = sum(1 for r in results if r == "sent")
+                        simulated = sum(1 for r in results if r == "simulated")
+                        failed = sum(1 for r in results if r.startswith("failed"))
+                        email_summary = f"реально надіслано: {sent} · симульовано: {simulated} · помилок: {failed}"
+                        execute("UPDATE announcements SET email_status=? WHERE id=?", (email_summary, new_ann_id))
+
+                    st.success("Оголошення опубліковано.")
+                    if email_summary:
+                        st.info(f"📧 Email-дублікати — {email_summary}")
+                    st.rerun()
+
+    # ================================================================
+    # 🗂️ ІСТОРІЯ ТА КЕРУВАННЯ
+    # ================================================================
+    with tab_history:
+        hist_all = query_df("""SELECT a.id, a.created_at, a.event_id, COALESCE(e.title,'Глобальне') AS event,
+                                       COALESCE(t.name,'Усі команди') AS target, a.title, a.body,
+                                       COALESCE(a.priority,'Звичайне') AS priority,
+                                       COALESCE(a.audience,'Усі') AS audience,
+                                       a.created_by_name, a.email_status
+                                FROM announcements a
+                                LEFT JOIN events e ON a.event_id=e.id
+                                LEFT JOIN teams t ON a.target_team_id=t.id
+                                ORDER BY a.created_at DESC""")
+        if hist_all.empty:
+            st.info("Оголошень ще не було.")
+        else:
+            fc1, fc2, fc3 = st.columns([2, 2, 2])
+            with fc1:
+                event_filter = st.multiselect("Фільтр за подією", sorted(hist_all["event"].unique().tolist()))
+            with fc2:
+                priority_filter = st.multiselect("Фільтр за пріоритетом", sorted(hist_all["priority"].unique().tolist()))
+            with fc3:
+                search_ann = st.text_input("🔎 Пошук за заголовком/текстом")
+
+            view = hist_all
+            if event_filter:
+                view = view[view["event"].isin(event_filter)]
+            if priority_filter:
+                view = view[view["priority"].isin(priority_filter)]
+            if search_ann.strip():
+                q = search_ann.strip().lower()
+                view = view[view["title"].fillna("").str.lower().str.contains(q)
+                            | view["body"].fillna("").str.lower().str.contains(q)]
+
+            st.caption(f"Знайдено оголошень: {len(view)}")
+            for _, a in view.iterrows():
+                badge = "⭐ " if a["priority"] == "⭐ Важливе" else ""
+                with st.container(border=True):
+                    hc1, hc2 = st.columns([5, 1])
+                    with hc1:
+                        st.markdown(f"**{badge}{a['title']}**")
+                        st.caption(f"{a['created_at']} · {a['event']} · Отримувач: {a['target']} "
+                                   f"· Аудиторія: {a['audience']}"
+                                   + (f" · Автор: {a['created_by_name']}" if a['created_by_name'] else ""))
+                    with hc2:
+                        if st.button("🗑️ Видалити", key=f"del_ann_{a['id']}"):
+                            execute("DELETE FROM announcements WHERE id=?", (int(a["id"]),))
+                            st.rerun()
+                    st.write(a["body"])
+                    if a["email_status"]:
+                        st.caption(f"📧 Email-дублікати: {a['email_status']}")
+
+    # ================================================================
+    # 📊 ОГЛЯД ОХОПЛЕННЯ
+    # ================================================================
+    with tab_stats:
+        stats_all = query_df("""SELECT a.id, COALESCE(e.title,'Глобальне') AS event,
+                                        COALESCE(a.priority,'Звичайне') AS priority, a.email_status
+                                 FROM announcements a LEFT JOIN events e ON a.event_id=e.id""")
+        if stats_all.empty:
+            st.info("Ще немає даних для статистики — опублікуйте перше оголошення.")
+        else:
+            total_ann = len(stats_all)
+            important_ann = int((stats_all["priority"] == "⭐ Важливе").sum())
+            with_email = int(stats_all["email_status"].notna().sum())
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Всього оголошень", total_ann)
+            sc2.metric("⭐ Важливих", important_ann)
+            sc3.metric("З email-дублюванням", with_email)
+
+            st.markdown("#### Оголошення за подіями")
+            by_event = stats_all.groupby("event").size().reset_index(name="Оголошень")
+            chart_ann = alt.Chart(by_event).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("Оголошень:Q"),
+                y=alt.Y("event:N", sort="-x", title="Подія"),
+                color=alt.Color("Оголошень:Q", scale=alt.Scale(scheme="blues"), legend=None),
+                tooltip=["event", "Оголошень"],
+            ).properties(height=max(160, 32 * len(by_event)))
+            st.altair_chart(chart_ann, use_container_width=True)
+
+            st.markdown("#### Скільки учасників побачить кожне активне оголошення")
+            reach_rows = []
+            active_events = query_df("""SELECT a.id, a.title, a.event_id, a.target_team_id
+                                         FROM announcements a WHERE a.event_id IS NOT NULL""")
+            for _, a in active_events.iterrows():
+                if a["target_team_id"]:
+                    n = query_one("SELECT COUNT(*) FROM team_members WHERE team_id=?", (int(a["target_team_id"]),))[0]
+                else:
+                    n = query_one("""SELECT COUNT(*) FROM team_members tm
+                                      JOIN teams t ON tm.team_id=t.id WHERE t.event_id=?""",
+                                   (int(a["event_id"]),))[0]
+                reach_rows.append({"Оголошення": a["title"], "Учасників охоплено": n})
+            global_ann_count = len(stats_all) - len(active_events)
+            if global_ann_count > 0:
+                total_participants = query_one("SELECT COUNT(*) FROM users WHERE role='participant'")[0]
+                reach_rows.append({"Оголошення": f"Глобальні оголошення ({global_ann_count} шт.)",
+                                    "Учасників охоплено": total_participants})
+            if reach_rows:
+                st.dataframe(pd.DataFrame(reach_rows), use_container_width=True, hide_index=True)
 
 
 def admin_import_export():
@@ -3069,18 +3285,24 @@ def page_announcements_view():
     my_team_ids = query_df("SELECT team_id FROM team_members WHERE user_id=?", (user["id"],))["team_id"].tolist()
     if my_team_ids:
         placeholders = ",".join(["?"] * len(my_team_ids))
-        sql = f"""SELECT created_at, title, body FROM announcements
+        sql = f"""SELECT created_at, title, body, COALESCE(priority,'Звичайне') AS priority
+                  FROM announcements
                   WHERE target_team_id IS NULL OR target_team_id IN ({placeholders})
                   ORDER BY created_at DESC"""
         anns = query_df(sql, my_team_ids)
     else:
-        anns = query_df("SELECT created_at, title, body FROM announcements WHERE target_team_id IS NULL ORDER BY created_at DESC")
+        anns = query_df("""SELECT created_at, title, body, COALESCE(priority,'Звичайне') AS priority
+                            FROM announcements WHERE target_team_id IS NULL ORDER BY created_at DESC""")
     if anns.empty:
         st.info("Оголошень поки немає.")
     else:
+        anns = anns.copy()
+        anns["_is_important"] = (anns["priority"] == "⭐ Важливе").astype(int)
+        anns = anns.sort_values(["_is_important", "created_at"], ascending=[False, False])
         for _, a in anns.iterrows():
+            badge = "⭐ " if a["priority"] == "⭐ Важливе" else ""
             with st.container(border=True):
-                st.markdown(f"**{a['title']}**")
+                st.markdown(f"**{badge}{a['title']}**")
                 st.caption(a["created_at"])
                 st.write(a["body"])
 
