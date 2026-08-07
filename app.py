@@ -489,6 +489,21 @@ def compute_team_score(team_id):
     return round(weighted, 2)
 
 
+def compute_team_score_for_jury(team_id, jury_id):
+    """Зважений бал команди на основі оцінок лише ОДНОГО конкретного журі (без усереднення з іншими)."""
+    scores_df = query_df("""SELECT s.criterion_id, s.score, c.weight, c.max_score
+                             FROM scores s JOIN criteria c ON s.criterion_id=c.id
+                             WHERE s.team_id=? AND s.jury_id=?""", (team_id, jury_id))
+    if scores_df.empty:
+        return None
+    scores_df["norm"] = scores_df["score"] / scores_df["max_score"] * 100
+    total_weight = scores_df["weight"].sum()
+    if total_weight == 0:
+        return None
+    weighted = (scores_df["norm"] * scores_df["weight"]).sum() / total_weight
+    return round(weighted, 2)
+
+
 def detect_anomalies(event_id):
     """Знаходить оцінки журі, що суттєво відхиляються від середнього по команді/критерію."""
     df = query_df("""SELECT s.id, s.team_id, s.jury_id, s.criterion_id, s.score,
@@ -3539,7 +3554,7 @@ def page_jury():
     elif menu == "🖼️ Портфоліо проєктів":
         page_showcase()
     elif menu == "📢 Оголошення":
-        page_announcements_view()
+        page_jury_announcements()
 
 
 def jury_evaluation():
@@ -3580,30 +3595,95 @@ def jury_evaluation():
         st.info("Немає прийнятих команд для оцінювання.")
         return
 
+    crit_count = len(criteria)
+
+    # ------------------------------------------------------------
+    # Готуємо статус кожної команди: конфлікт інтересів / оцінено чи ні
+    # ------------------------------------------------------------
+    team_items = []
     for _, t in teams.iterrows():
+        conflict = has_conflict(ev_id, t["id"], user)
+        scored_cnt = query_one("SELECT COUNT(DISTINCT criterion_id) FROM scores WHERE team_id=? AND jury_id=?",
+                                (t["id"], user["id"]))[0]
+        is_scored = bool(crit_count) and scored_cnt >= crit_count
+        team_items.append({"row": t, "conflict": conflict, "scored": is_scored})
+
+    scorable = [ti for ti in team_items if not ti["conflict"]]
+    scored_count = sum(1 for ti in scorable if ti["scored"])
+    total_scorable = len(scorable)
+
+    # ------------------------------------------------------------
+    # Прогрес-дашборд
+    # ------------------------------------------------------------
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("Команд призначено", len(teams))
+    pc2.metric("Оцінено повністю", f"{scored_count}/{total_scorable}" if total_scorable else "0/0")
+    pct = round(scored_count / total_scorable * 100, 1) if total_scorable else 0
+    pc3.metric("Мій прогрес", f"{pct}%")
+    st.progress(min(pct / 100, 1.0))
+    if total_scorable and scored_count == total_scorable:
+        st.success("✅ Ви завершили оцінювання всіх призначених вам команд у цій події.")
+
+    # ------------------------------------------------------------
+    # Фільтри та сортування
+    # ------------------------------------------------------------
+    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    with fc2:
+        only_unscored = st.checkbox("Лише неоцінені")
+    with fc3:
+        sort_choice = st.selectbox("Порядок", ["За замовчуванням", "Спочатку неоцінені"])
+    with fc1:
+        if double_blind:
+            search_q = ""
+            st.caption("🔎 Пошук за назвою вимкнено — увімкнено сліпе оцінювання.")
+        else:
+            search_q = st.text_input("🔎 Пошук за назвою команди або факультетом")
+
+    filtered_items = team_items
+    if only_unscored:
+        filtered_items = [ti for ti in filtered_items if not ti["conflict"] and not ti["scored"]]
+    if search_q.strip():
+        q = search_q.strip().lower()
+        filtered_items = [ti for ti in filtered_items
+                           if q in str(ti["row"]["name"]).lower() or q in str(ti["row"]["faculty"]).lower()]
+    if sort_choice == "Спочатку неоцінені":
+        filtered_items = sorted(filtered_items, key=lambda ti: (ti["conflict"], ti["scored"]))
+
+    if not filtered_items:
+        st.info("Немає команд за обраними фільтрами.")
+        return
+
+    # ------------------------------------------------------------
+    # Картки команд для оцінювання
+    # ------------------------------------------------------------
+    for ti in filtered_items:
+        t = ti["row"]
         display_name = anon_code(t["id"]) if double_blind else f"{t['name']} ({t['faculty']})"
 
-        if has_conflict(ev_id, t["id"], user):
+        if ti["conflict"]:
             with st.container(border=True):
                 st.markdown(f"### {display_name if double_blind else t['name']}")
                 st.warning("⛔ Оцінювання недоступне: команда належить до вашого факультету (конфлікт інтересів).")
             continue
 
         with st.container(border=True):
-            st.markdown(f"### {display_name}")
-            sub = query_one("""SELECT repo_link, presentation_link, video_link, description
-                                FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
+            status_badge = "✅ Оцінено" if ti["scored"] else "🕓 Ще не оцінено"
+            st.markdown(f"### {display_name}  ·  {status_badge}")
+
+            sub, file_row = get_latest_submission_with_file(int(t["id"]))
             if sub:
-                st.write(sub[3] or "_Опис відсутній_")
-                if sub[0]:
-                    st.write(f"🔗 Репозиторій: {sub[0]}")
-                if sub[2]:
-                    st.write(f"🎬 Відео: {sub[2]}")
-                files = query_df("""SELECT f.filename, f.id FROM files f
-                                     JOIN submissions s ON f.submission_id=s.id
-                                     WHERE s.team_id=? ORDER BY f.uploaded_at DESC LIMIT 1""", (t["id"],))
-                if not files.empty:
-                    st.write(f"📄 Презентація: {files.iloc[0]['filename']}")
+                tags = parse_tags(sub.get("tags"))
+                if tags:
+                    st.markdown(" ".join(f"`{tag}`" for tag in tags[:6]))
+                st.write(sub.get("description") or "_Опис відсутній_")
+                if sub.get("repo_link"):
+                    st.write(f"🔗 Репозиторій: {sub['repo_link']}")
+                if sub.get("video_link"):
+                    with st.expander("🎬 Демо-відео"):
+                        st.video(youtube_embed_url(sub["video_link"]))
+                if file_row:
+                    with st.expander(f"📄 Переглянути презентацію ({file_row['filename']})"):
+                        render_pdf_inline(file_row["data"], height=420)
             else:
                 st.warning("Команда ще не завантажила подачу.")
 
@@ -3618,6 +3698,11 @@ def jury_evaluation():
                         st.dataframe(others.rename(columns={"criterion": "Критерій", "jury": "Журі",
                                                              "score": "Оцінка", "feedback": "Фідбек"}),
                                      use_container_width=True, hide_index=True)
+
+            last_score_ts = query_one("SELECT created_at FROM scores WHERE team_id=? AND jury_id=? "
+                                       "ORDER BY created_at DESC LIMIT 1", (t["id"], user["id"]))
+            if last_score_ts:
+                st.caption(f"🕓 Востаннє оцінено вами: {last_score_ts[0][:16]}")
 
             with st.form(f"score_form_{t['id']}"):
                 score_vals = {}
@@ -3642,6 +3727,104 @@ def jury_evaluation():
                                 (t["id"], user["id"], crit_id, val, feedback, now()))
                     st.success("Оцінку збережено.")
                     st.rerun()
+
+    # ------------------------------------------------------------
+    # Самоаналіз: мої оцінки в порівнянні із загальним середнім
+    # ------------------------------------------------------------
+    my_rated = [ti for ti in scorable if ti["scored"]]
+    if my_rated:
+        st.markdown("---")
+        st.markdown("#### 📊 Огляд моїх оцінок по командах цієї події")
+        overview_rows = []
+        for ti in my_rated:
+            t = ti["row"]
+            name_for_overview = anon_code(t["id"]) if double_blind else t["name"]
+            my_score = compute_team_score_for_jury(int(t["id"]), user["id"])
+            overall_score = compute_team_score(int(t["id"]))
+            overview_rows.append({"Команда": name_for_overview, "Мій бал": my_score,
+                                   "Загальний середній бал": overall_score,
+                                   "Різниця": round(my_score - overall_score, 2)
+                                   if my_score is not None and overall_score is not None else None})
+        overview_df = pd.DataFrame(overview_rows)
+        st.dataframe(overview_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 🎯 Мій середній бал за критеріями (у цій події)")
+        crit_rows = []
+        for _, crit in criteria.iterrows():
+            avg_row = query_one("""SELECT AVG(score) FROM scores WHERE jury_id=? AND criterion_id=? AND team_id IN
+                                    (SELECT id FROM teams WHERE event_id=?)""", (user["id"], crit["id"], ev_id))
+            if avg_row and avg_row[0] is not None:
+                crit_rows.append({"Критерій": crit["name"], "Мій сер. бал": round(avg_row[0], 2),
+                                   "Максимум": crit["max_score"]})
+        if crit_rows:
+            crit_df = pd.DataFrame(crit_rows)
+            crit_chart = alt.Chart(crit_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("Критерій:N", sort=None),
+                y=alt.Y("Мій сер. бал:Q"),
+                color=alt.Color("Мій сер. бал:Q", scale=alt.Scale(scheme="teals"), legend=None),
+                tooltip=["Критерій", "Мій сер. бал", "Максимум"],
+            ).properties(height=280)
+            st.altair_chart(crit_chart, use_container_width=True)
+
+
+def page_jury_announcements():
+    st.subheader("📢 Оголошення")
+    st.caption("Показані глобальні оголошення платформи та оголошення для подій, на які вас призначено журі.")
+    user = st.session_state.user
+
+    assigned_events = query_df("""SELECT DISTINCT e.id, e.title FROM jury_assignments ja
+                                   JOIN events e ON ja.event_id=e.id WHERE ja.jury_id=?""", (user["id"],))
+
+    if assigned_events.empty:
+        anns = query_df("""SELECT a.created_at, a.title, a.body, COALESCE(a.priority,'Звичайне') AS priority,
+                                   'Глобальне' AS event
+                            FROM announcements a
+                            WHERE a.event_id IS NULL AND a.target_team_id IS NULL
+                            ORDER BY a.created_at DESC""")
+    else:
+        ids = assigned_events["id"].tolist()
+        placeholders = ",".join(["?"] * len(ids))
+        anns = query_df(f"""SELECT a.created_at, a.title, a.body, COALESCE(a.priority,'Звичайне') AS priority,
+                                    COALESCE(e.title,'Глобальне') AS event
+                             FROM announcements a
+                             LEFT JOIN events e ON a.event_id=e.id
+                             WHERE a.target_team_id IS NULL
+                               AND (a.event_id IS NULL OR a.event_id IN ({placeholders}))
+                             ORDER BY a.created_at DESC""", ids)
+
+    if anns.empty:
+        st.info("Оголошень поки немає.")
+        return
+
+    fc1, fc2 = st.columns([2, 2])
+    with fc1:
+        event_options = sorted(anns["event"].unique().tolist())
+        event_filter = st.multiselect("Фільтр за подією", event_options)
+    with fc2:
+        search_ann = st.text_input("🔎 Пошук за заголовком/текстом")
+
+    view = anns.copy()
+    if event_filter:
+        view = view[view["event"].isin(event_filter)]
+    if search_ann.strip():
+        q = search_ann.strip().lower()
+        view = view[view["title"].fillna("").str.lower().str.contains(q)
+                    | view["body"].fillna("").str.lower().str.contains(q)]
+
+    if view.empty:
+        st.info("За обраними фільтрами оголошень не знайдено.")
+        return
+
+    view["_is_important"] = (view["priority"] == "⭐ Важливе").astype(int)
+    view = view.sort_values(["_is_important", "created_at"], ascending=[False, False])
+
+    st.caption(f"Знайдено оголошень: {len(view)}")
+    for _, a in view.iterrows():
+        badge = "⭐ " if a["priority"] == "⭐ Важливе" else ""
+        with st.container(border=True):
+            st.markdown(f"**{badge}{a['title']}**")
+            st.caption(f"{a['created_at']} · {a['event']}")
+            st.write(a["body"])
 
 
 # ============================================================
