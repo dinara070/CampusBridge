@@ -3841,7 +3841,29 @@ def page_mentor():
     elif menu == "🖼️ Портфоліо проєктів":
         page_showcase()
     elif menu == "📢 Оголошення":
-        page_announcements_view()
+        page_mentor_announcements()
+
+
+def _parse_hhmm(text):
+    try:
+        return datetime.datetime.strptime(str(text).strip(), "%H:%M").time()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _generate_slot_windows(start_t, end_t, duration_min, break_min):
+    """Розбиває часовий проміжок на послідовні слоти заданої тривалості з перервами між ними."""
+    windows = []
+    base_day = datetime.date.today()
+    cur = datetime.datetime.combine(base_day, start_t)
+    end_dt = datetime.datetime.combine(base_day, end_t)
+    step = timedelta(minutes=duration_min)
+    gap = timedelta(minutes=break_min)
+    while cur + step <= end_dt:
+        slot_end = cur + step
+        windows.append((cur.strftime("%H:%M"), slot_end.strftime("%H:%M")))
+        cur = slot_end + gap
+    return windows
 
 
 def mentor_slots_manager():
@@ -3853,50 +3875,274 @@ def mentor_slots_manager():
         st.info("Подій ще немає.")
         return
     ev_map = dict(zip(events["title"], events["id"]))
-    ev_title = st.selectbox("Подія", list(ev_map.keys()))
+    ev_title = st.selectbox("Подія", list(ev_map.keys()), key="mentor_main_event")
     ev_id = ev_map[ev_title]
 
-    st.markdown("#### ➕ Додати новий слот")
-    with st.form("add_slot_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            slot_date = st.text_input("Дата (ГГГГ-ММ-ДД)")
-        with c2:
-            start_time = st.text_input("Початок (ГГ:ХХ)", value="10:00")
-        with c3:
-            end_time = st.text_input("Кінець (ГГ:ХХ)", value="10:15")
-        location = st.text_input("Місце проведення / посилання (Zoom, Meet тощо)", value="Онлайн")
-        notes = st.text_input("Примітка (необов'язково)", value="")
-        if st.form_submit_button("Додати слот") and slot_date and start_time and end_time:
-            execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
-                       location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (user["id"], ev_id, slot_date, start_time, end_time, location, 0, None, notes, now()))
-            st.success("Слот додано до розкладу.")
-            st.rerun()
+    tab_add, tab_schedule, tab_stats = st.tabs(
+        ["➕ Додати слоти", "🗓️ Мій розклад", "📊 Статистика"])
 
-    st.markdown("#### Мій розклад консультацій")
-    my_slots = query_df("""SELECT ms.id, ms.slot_date, ms.start_time, ms.end_time, ms.location,
-                                   COALESCE(t.name,'—') AS team,
-                                   CASE WHEN ms.is_booked=1 THEN '🔴 заброньовано' ELSE '🟢 вільно' END AS status
-                            FROM mentor_slots ms LEFT JOIN teams t ON ms.team_id=t.id
-                            WHERE ms.mentor_id=? AND ms.event_id=?
-                            ORDER BY ms.slot_date, ms.start_time""", (user["id"], ev_id))
-    if my_slots.empty:
-        st.info("Слотів ще не створено.")
+    # ================================================================
+    # ➕ ДОДАТИ СЛОТИ
+    # ================================================================
+    with tab_add:
+        st.markdown("#### Один слот")
+        with st.form("add_slot_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                slot_date = st.text_input("Дата (ГГГГ-ММ-ДД)")
+            with c2:
+                start_time = st.text_input("Початок (ГГ:ХХ)", value="10:00")
+            with c3:
+                end_time = st.text_input("Кінець (ГГ:ХХ)", value="10:15")
+            location = st.text_input("Місце проведення / посилання (Zoom, Meet тощо)", value="Онлайн")
+            notes = st.text_input("Примітка (необов'язково)", value="")
+            if st.form_submit_button("Додати слот") and slot_date and start_time and end_time:
+                execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+                           location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (user["id"], ev_id, slot_date, start_time, end_time, location, 0, None, notes, now()))
+                st.success("Слот додано до розкладу.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 🧩 Масове створення слотів на день")
+        st.caption("Задайте робочу сесію (наприклад, 10:00–13:00), тривалість одного слоту та перерву між ними — "
+                   "система сама розіб'є цей проміжок на послідовні слоти.")
+        bd1, bd2, bd3 = st.columns(3)
+        with bd1:
+            bulk_date = st.text_input("Дата (ГГГГ-ММ-ДД)", key="bulk_date")
+        with bd2:
+            bulk_start = st.text_input("Початок сесії (ГГ:ХХ)", value="10:00", key="bulk_start")
+        with bd3:
+            bulk_end = st.text_input("Кінець сесії (ГГ:ХХ)", value="13:00", key="bulk_end")
+        bd4, bd5, bd6 = st.columns(3)
+        with bd4:
+            bulk_duration = st.number_input("Тривалість слоту, хв", min_value=5, max_value=180, value=15, step=5)
+        with bd5:
+            bulk_break = st.number_input("Перерва між слотами, хв", min_value=0, max_value=60, value=0, step=5)
+        with bd6:
+            bulk_location = st.text_input("Місце / посилання", value="Онлайн", key="bulk_loc")
+        bulk_notes = st.text_input("Примітка (необов'язково)", value="", key="bulk_notes")
+
+        start_t, end_t = _parse_hhmm(bulk_start), _parse_hhmm(bulk_end)
+        if bulk_date and start_t and end_t:
+            windows = _generate_slot_windows(start_t, end_t, int(bulk_duration), int(bulk_break))
+            if not windows:
+                st.warning("З обраними параметрами не вдалось сформувати жодного слоту — перевірте час і тривалість.")
+            else:
+                st.info(f"Буде створено **{len(windows)}** слот(ів): "
+                        + ", ".join(f"{s}–{e}" for s, e in windows[:8])
+                        + (" …" if len(windows) > 8 else ""))
+                if st.button(f"➕ Створити {len(windows)} слот(ів)"):
+                    existing = query_df("""SELECT start_time FROM mentor_slots
+                                            WHERE mentor_id=? AND event_id=? AND slot_date=?""",
+                                         (user["id"], ev_id, bulk_date))
+                    existing_starts = set(existing["start_time"].tolist()) if not existing.empty else set()
+                    created, skipped_dup = 0, 0
+                    for s, e in windows:
+                        if s in existing_starts:
+                            skipped_dup += 1
+                            continue
+                        execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+                                   location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                (user["id"], ev_id, bulk_date, s, e, bulk_location, 0, None, bulk_notes, now()))
+                        created += 1
+                    st.success(f"Створено {created} слот(ів)."
+                               + (f" Пропущено {skipped_dup} через дублювання часу." if skipped_dup else ""))
+                    st.rerun()
+        else:
+            st.caption("Вкажіть дату та коректний час початку/кінця сесії (формат ГГ:ХХ), щоб побачити попередній перегляд.")
+
+    # ================================================================
+    # 🗓️ МІЙ РОЗКЛАД
+    # ================================================================
+    with tab_schedule:
+        all_my_slots = query_df("""SELECT ms.id, ms.slot_date, ms.start_time, ms.end_time, ms.location,
+                                           ms.notes, ms.team_id, COALESCE(t.name,'—') AS team,
+                                           ms.is_booked
+                                    FROM mentor_slots ms LEFT JOIN teams t ON ms.team_id=t.id
+                                    WHERE ms.mentor_id=? AND ms.event_id=?
+                                    ORDER BY ms.slot_date, ms.start_time""", (user["id"], ev_id))
+        if all_my_slots.empty:
+            st.info("Слотів ще не створено — додайте їх на вкладці «➕ Додати слоти».")
+        else:
+            today_str = str(datetime.date.today())
+            upcoming_booked = all_my_slots[(all_my_slots["is_booked"] == 1) & (all_my_slots["slot_date"] >= today_str)]
+            if not upcoming_booked.empty:
+                st.markdown("#### 🔔 Найближчі заброньовані консультації")
+                for _, s in upcoming_booked.head(5).iterrows():
+                    contact = query_one("""SELECT u.full_name, u.email FROM teams t
+                                            LEFT JOIN users u ON t.captain_id=u.id WHERE t.id=?""", (int(s["team_id"]),))
+                    contact_str = f" · 📧 {contact[1]}" if contact and contact[1] else ""
+                    st.info(f"**{s['slot_date']} {s['start_time']}–{s['end_time']}** · команда «{s['team']}»"
+                            f"{contact_str} · {s['location'] or 'онлайн'}")
+
+            st.markdown("#### Фільтри розкладу")
+            f1, f2 = st.columns(2)
+            with f1:
+                status_filter_s = st.selectbox("Статус", ["Усі", "Тільки вільні", "Тільки заброньовані"])
+            with f2:
+                period_filter = st.selectbox("Період", ["Усі", "Лише майбутні", "Лише минулі"])
+
+            view = all_my_slots.copy()
+            if status_filter_s == "Тільки вільні":
+                view = view[view["is_booked"] == 0]
+            elif status_filter_s == "Тільки заброньовані":
+                view = view[view["is_booked"] == 1]
+            if period_filter == "Лише майбутні":
+                view = view[view["slot_date"] >= today_str]
+            elif period_filter == "Лише минулі":
+                view = view[view["slot_date"] < today_str]
+
+            if view.empty:
+                st.info("Немає слотів за обраними фільтрами.")
+            else:
+                display_df = view.copy()
+                display_df["Статус"] = display_df["is_booked"].apply(lambda x: "🔴 заброньовано" if x == 1 else "🟢 вільно")
+                st.dataframe(display_df[["id", "slot_date", "start_time", "end_time", "location", "team", "Статус"]]
+                             .rename(columns={"id": "ID", "slot_date": "Дата", "start_time": "Початок",
+                                               "end_time": "Кінець", "location": "Місце", "team": "Команда"}),
+                             use_container_width=True, hide_index=True)
+
+                st.markdown("#### Керування слотами")
+                for _, s in view.iterrows():
+                    with st.container(border=True):
+                        status_lbl = "🔴 заброньовано" if s["is_booked"] == 1 else "🟢 вільно"
+                        st.write(f"**#{s['id']}** · {s['slot_date']} {s['start_time']}–{s['end_time']} "
+                                 f"· {s['location'] or 'онлайн'} · {status_lbl} · {s['team']}")
+                        if s["notes"]:
+                            st.caption(f"📝 {s['notes']}")
+
+                        with st.expander("✏️ Редагувати слот"):
+                            with st.form(f"edit_slot_form_{s['id']}"):
+                                ec1, ec2, ec3 = st.columns(3)
+                                with ec1:
+                                    new_date = st.text_input("Дата", value=s["slot_date"], key=f"edate_{s['id']}")
+                                with ec2:
+                                    new_start = st.text_input("Початок", value=s["start_time"], key=f"estart_{s['id']}")
+                                with ec3:
+                                    new_end = st.text_input("Кінець", value=s["end_time"], key=f"eend_{s['id']}")
+                                new_location = st.text_input("Місце / посилання", value=s["location"] or "",
+                                                              key=f"eloc_{s['id']}")
+                                new_notes = st.text_input("Примітка", value=s["notes"] or "", key=f"enotes_{s['id']}")
+                                if st.form_submit_button("💾 Зберегти зміни"):
+                                    execute("""UPDATE mentor_slots SET slot_date=?, start_time=?, end_time=?,
+                                               location=?, notes=? WHERE id=?""",
+                                            (new_date, new_start, new_end, new_location, new_notes, int(s["id"])))
+                                    st.success("Слот оновлено.")
+                                    st.rerun()
+
+                        bc1, bc2 = st.columns(2)
+                        with bc1:
+                            if s["is_booked"] == 1:
+                                if st.button("🔓 Звільнити (скасувати бронювання)", key=f"unbook_mentor_{s['id']}"):
+                                    execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE id=?", (int(s["id"]),))
+                                    st.rerun()
+                        with bc2:
+                            if st.button("🗑️ Видалити слот", key=f"del_slot_{s['id']}"):
+                                execute("DELETE FROM mentor_slots WHERE id=?", (int(s["id"]),))
+                                st.rerun()
+
+    # ================================================================
+    # 📊 СТАТИСТИКА
+    # ================================================================
+    with tab_stats:
+        my_all_events_slots = query_df("""SELECT ms.*, e.title AS event_title FROM mentor_slots ms
+                                           JOIN events e ON ms.event_id=e.id WHERE ms.mentor_id=?""", (user["id"],))
+        if my_all_events_slots.empty:
+            st.info("У вас ще немає жодного слоту.")
+        else:
+            total = len(my_all_events_slots)
+            booked = int((my_all_events_slots["is_booked"] == 1).sum())
+            free = total - booked
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Всього слотів (усі події)", total)
+            sc2.metric("Заброньовано", booked)
+            sc3.metric("Вільно", free)
+            st.progress(min(booked / total, 1.0) if total else 0)
+
+            st.markdown("#### Слотів за подіями")
+            by_ev = my_all_events_slots.groupby("event_title").size().reset_index(name="Слотів")
+            chart_ev = alt.Chart(by_ev).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("Слотів:Q"),
+                y=alt.Y("event_title:N", sort="-x", title="Подія"),
+                color=alt.Color("Слотів:Q", scale=alt.Scale(scheme="teals"), legend=None),
+                tooltip=["event_title", "Слотів"],
+            ).properties(height=max(160, 32 * len(by_ev)))
+            st.altair_chart(chart_ev, use_container_width=True)
+
+            st.markdown("#### Бронювання за датами")
+            booked_df = my_all_events_slots[my_all_events_slots["is_booked"] == 1]
+            if not booked_df.empty:
+                by_date = booked_df.groupby("slot_date").size().reset_index(name="Бронювань")
+                chart_date = alt.Chart(by_date).mark_bar().encode(
+                    x=alt.X("slot_date:N", title="Дата", sort=None),
+                    y=alt.Y("Бронювань:Q"),
+                    color=alt.value("#4F8BF9"),
+                    tooltip=["slot_date", "Бронювань"],
+                ).properties(height=280)
+                st.altair_chart(chart_date, use_container_width=True)
+            else:
+                st.caption("Заброньованих слотів поки немає.")
+
+
+def page_mentor_announcements():
+    st.subheader("📢 Оголошення")
+    st.caption("Показані глобальні оголошення платформи та оголошення для подій, у яких ви ведете Office Hours.")
+    user = st.session_state.user
+
+    assigned_events = query_df("""SELECT DISTINCT e.id, e.title FROM mentor_slots ms
+                                   JOIN events e ON ms.event_id=e.id WHERE ms.mentor_id=?""", (user["id"],))
+
+    if assigned_events.empty:
+        anns = query_df("""SELECT a.created_at, a.title, a.body, COALESCE(a.priority,'Звичайне') AS priority,
+                                   'Глобальне' AS event
+                            FROM announcements a
+                            WHERE a.event_id IS NULL AND a.target_team_id IS NULL
+                            ORDER BY a.created_at DESC""")
+    else:
+        ids = assigned_events["id"].tolist()
+        placeholders = ",".join(["?"] * len(ids))
+        anns = query_df(f"""SELECT a.created_at, a.title, a.body, COALESCE(a.priority,'Звичайне') AS priority,
+                                    COALESCE(e.title,'Глобальне') AS event
+                             FROM announcements a
+                             LEFT JOIN events e ON a.event_id=e.id
+                             WHERE a.target_team_id IS NULL
+                               AND (a.event_id IS NULL OR a.event_id IN ({placeholders}))
+                             ORDER BY a.created_at DESC""", ids)
+
+    if anns.empty:
+        st.info("Оголошень поки немає.")
         return
 
-    st.dataframe(my_slots, use_container_width=True, hide_index=True)
+    fc1, fc2 = st.columns([2, 2])
+    with fc1:
+        event_options = sorted(anns["event"].unique().tolist())
+        event_filter = st.multiselect("Фільтр за подією", event_options)
+    with fc2:
+        search_ann = st.text_input("🔎 Пошук за заголовком/текстом")
 
-    st.markdown("#### Керування слотами")
-    for _, s in my_slots.iterrows():
-        label = f"#{s['id']} · {s['slot_date']} {s['start_time']}–{s['end_time']} · {s['status']} · {s['team']}"
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            st.write(label)
-        with c2:
-            if st.button("🗑️ Видалити", key=f"del_slot_{s['id']}"):
-                execute("DELETE FROM mentor_slots WHERE id=?", (int(s["id"]),))
-                st.rerun()
+    view = anns.copy()
+    if event_filter:
+        view = view[view["event"].isin(event_filter)]
+    if search_ann.strip():
+        q = search_ann.strip().lower()
+        view = view[view["title"].fillna("").str.lower().str.contains(q)
+                    | view["body"].fillna("").str.lower().str.contains(q)]
+
+    if view.empty:
+        st.info("За обраними фільтрами оголошень не знайдено.")
+        return
+
+    view["_is_important"] = (view["priority"] == "⭐ Важливе").astype(int)
+    view = view.sort_values(["_is_important", "created_at"], ascending=[False, False])
+
+    st.caption(f"Знайдено оголошень: {len(view)}")
+    for _, a in view.iterrows():
+        badge = "⭐ " if a["priority"] == "⭐ Важливе" else ""
+        with st.container(border=True):
+            st.markdown(f"**{badge}{a['title']}**")
+            st.caption(f"{a['created_at']} · {a['event']}")
+            st.write(a["body"])
 
 
 # ============================================================
