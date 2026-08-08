@@ -412,7 +412,89 @@ def init_db():
             c.execute("""INSERT INTO scores (team_id,jury_id,criterion_id,score,feedback,created_at)
                 VALUES (?,?,?,?,?,?)""", (archive_team_id, jury_demo_id, cid, 9.0, "Відмінна робота!", now()))
 
+        # призначення демо-журі на демо-подію — без цього розділ "Оцінювання" для jury_demo
+        # виглядав би порожнім, хоча оцінки вище вже виставлені
+        c.execute("INSERT INTO jury_assignments (event_id,jury_id,nomination_id) VALUES (?,?,?)",
+                  (demo_event_id, jury_demo_id, None))
+
+        # демо-слоти ментора на демо-подію: один вільний і один заброньований демо-командою,
+        # щоб розділ "Мої слоти консультацій" не був порожнім із коробки
+        c.execute("SELECT id FROM users WHERE username='mentor_demo'")
+        mentor_demo_id = c.fetchone()[0]
+        c.execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+            location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (mentor_demo_id, demo_event_id, "2026-09-21", "11:00", "11:15",
+             "Онлайн (Google Meet)", 1, demo_team_id, "Обговорення архітектури рекомендаційної моделі", now()))
+        c.execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+            location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (mentor_demo_id, demo_event_id, "2026-09-21", "11:30", "11:45",
+             "Онлайн (Google Meet)", 0, None, "", now()))
+
+        # демо-оголошення: одне глобальне і одне по демо-події з різними пріоритетами,
+        # щоб розділ "Оголошення" одразу мав приклад для всіх ролей
+        c.execute("""INSERT INTO announcements (event_id,title,body,target_team_id,created_at,
+            priority,audience,created_by_name,email_status) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (None, "Ласкаво просимо до CampusBridge!",
+             "Це демонстраційна платформа студентських хакатонів. Тут ви можете переглядати події, "
+             "подавати заявки, оцінювати проєкти та бронювати консультації з менторами.",
+             None, now(), "Звичайне", "Усі", "Адміністратор системи", None))
+        c.execute("""INSERT INTO announcements (event_id,title,body,target_team_id,created_at,
+            priority,audience,created_by_name,email_status) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (demo_event_id, "Нагадування: дедлайн подачі проєктів наближається",
+             "Не забудьте завантажити останню версію презентації та заповнити опис проєкту "
+             "до дедлайну пітчингу. Консультації з менторами доступні в розділі Office Hours.",
+             None, now(), "⭐ Важливе", "Усі команди", "Адміністратор системи", None))
+
         conn.commit()
+
+    # ------------------------------------------------------------------
+    # Самозцілення для вже розгорнутих інсталяцій платформи
+    # ------------------------------------------------------------------
+    # Демо-блок вище виконується лише один раз — коли в базі ще немає жодної події.
+    # Якщо цей код платформи розгортається поверх уже наповненої бази (наприклад,
+    # оновлення вже працюючого застосунку), демо-обліковий запис jury_demo міг
+    # лишитися без жодного призначення на подію. Перевіряємо це щоразу при старті
+    # й, за потреби, ідемпотентно призначаємо його на першу доступну подію, щоб
+    # розділ «Оцінювання» не виглядав порожнім для демонстрації ролі журі.
+    c.execute("SELECT id FROM users WHERE username='jury_demo'")
+    jury_demo_row = c.fetchone()
+    if jury_demo_row:
+        jury_demo_id_heal = jury_demo_row[0]
+        c.execute("SELECT COUNT(*) FROM jury_assignments WHERE jury_id=?", (jury_demo_id_heal,))
+        if c.fetchone()[0] == 0:
+            c.execute("SELECT id FROM events ORDER BY id LIMIT 1")
+            first_event = c.fetchone()
+            if first_event:
+                c.execute("INSERT INTO jury_assignments (event_id,jury_id,nomination_id) VALUES (?,?,?)",
+                          (first_event[0], jury_demo_id_heal, None))
+
+    # Аналогічно для демо-ментора: якщо в нього ще немає жодного слоту консультацій,
+    # створюємо один вільний слот на першій доступній події.
+    c.execute("SELECT id FROM users WHERE username='mentor_demo'")
+    mentor_demo_row = c.fetchone()
+    if mentor_demo_row:
+        mentor_demo_id_heal = mentor_demo_row[0]
+        c.execute("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=?", (mentor_demo_id_heal,))
+        if c.fetchone()[0] == 0:
+            c.execute("SELECT id FROM events ORDER BY id LIMIT 1")
+            first_event_m = c.fetchone()
+            if first_event_m:
+                c.execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+                    location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (mentor_demo_id_heal, first_event_m[0], str(datetime.date.today() + timedelta(days=14)),
+                     "11:00", "11:15", "Онлайн", 0, None, "", now()))
+    # Якщо на вже розгорнутій платформі ще жодного оголошення не публікували,
+    # додаємо демонстраційне глобальне оголошення, щоб розділ не виглядав порожнім.
+    c.execute("SELECT COUNT(*) FROM announcements")
+    if c.fetchone()[0] == 0:
+        c.execute("""INSERT INTO announcements (event_id,title,body,target_team_id,created_at,
+            priority,audience,created_by_name,email_status) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (None, "Ласкаво просимо до CampusBridge!",
+             "Це демонстраційна платформа студентських хакатонів. Тут ви можете переглядати події, "
+             "подавати заявки, оцінювати проєкти та бронювати консультації з менторами.",
+             None, now(), "Звичайне", "Усі", "Адміністратор системи", None))
+
+    conn.commit()
 
     conn.close()
 
