@@ -1220,6 +1220,86 @@ def logout():
     st.rerun()
 
 
+def refresh_session_user():
+    """Перечитує дані користувача з БД у st.session_state після редагування профілю."""
+    uid = st.session_state.user["id"]
+    row = query_one("SELECT * FROM users WHERE id=?", (uid,))
+    if row:
+        cols = ["id", "username", "password", "role", "full_name", "email",
+                "university", "faculty", "created_at"]
+        st.session_state.user = dict(zip(cols, row))
+
+
+ROLE_LABELS = {"admin": "Адміністратор", "participant": "Учасник", "jury": "Журі", "mentor": "Ментор"}
+
+
+def page_my_profile():
+    st.subheader("👤 Мій профіль")
+    user = st.session_state.user
+
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Роль", ROLE_LABELS.get(user["role"], user["role"]))
+            st.metric("Логін", user["username"])
+        with c2:
+            st.metric("У системі з", (user.get("created_at") or "—")[:10])
+            if user["role"] == "participant":
+                n_teams = query_one("SELECT COUNT(*) FROM team_members WHERE user_id=?", (user["id"],))[0]
+                st.metric("Моїх команд", n_teams)
+            elif user["role"] == "jury":
+                n_assign = query_one("SELECT COUNT(*) FROM jury_assignments WHERE jury_id=?", (user["id"],))[0]
+                n_scores = query_one("SELECT COUNT(*) FROM scores WHERE jury_id=?", (user["id"],))[0]
+                st.metric("Призначень / оцінок", f"{n_assign} / {n_scores}")
+            elif user["role"] == "mentor":
+                n_slots = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=?", (user["id"],))[0]
+                n_booked = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=? AND is_booked=1",
+                                      (user["id"],))[0]
+                st.metric("Слотів / заброньовано", f"{n_slots} / {n_booked}")
+            elif user["role"] == "admin":
+                n_events = query_one("SELECT COUNT(*) FROM events")[0]
+                st.metric("Подій у системі", n_events)
+
+    tab_edit, tab_password = st.tabs(["✏️ Редагувати дані", "🔑 Змінити пароль"])
+
+    with tab_edit:
+        with st.form("edit_profile_form"):
+            new_full_name = st.text_input("Повне ім'я", value=user.get("full_name") or "")
+            new_email = st.text_input("Пошта", value=user.get("email") or "")
+            faculty_label = "Факультет / кафедра" if user["role"] in ("participant", "jury", "admin") \
+                else "Спеціалізація / компанія"
+            new_faculty = st.text_input(faculty_label, value=user.get("faculty") or "")
+            if st.form_submit_button("💾 Зберегти зміни"):
+                if not new_full_name.strip():
+                    st.error("Повне ім'я не може бути порожнім.")
+                else:
+                    execute("UPDATE users SET full_name=?, email=?, faculty=? WHERE id=?",
+                            (new_full_name.strip(), new_email.strip(), new_faculty.strip(), user["id"]))
+                    refresh_session_user()
+                    st.success("Дані профілю оновлено.")
+                    st.rerun()
+
+    with tab_password:
+        st.caption("Пароль зберігається у вигляді хешу — його не бачить у відкритому вигляді навіть адміністратор.")
+        with st.form("change_password_form"):
+            current_pw = st.text_input("Поточний пароль", type="password")
+            new_pw1 = st.text_input("Новий пароль", type="password")
+            new_pw2 = st.text_input("Повторіть новий пароль", type="password")
+            if st.form_submit_button("🔑 Змінити пароль"):
+                if not current_pw or not new_pw1:
+                    st.error("Заповніть усі поля.")
+                elif hash_pw(current_pw) != user.get("password"):
+                    st.error("Поточний пароль вказано невірно.")
+                elif new_pw1 != new_pw2:
+                    st.error("Нові паролі не збігаються.")
+                elif len(new_pw1) < 4:
+                    st.error("Новий пароль має містити щонайменше 4 символи.")
+                else:
+                    execute("UPDATE users SET password=? WHERE id=?", (hash_pw(new_pw1), user["id"]))
+                    refresh_session_user()
+                    st.success("Пароль успішно змінено. Використовуйте його для наступного входу.")
+
+
 # ============================================================
 # ПУБЛІЧНІ СТОРІНКИ (без входу)
 # ============================================================
@@ -3349,7 +3429,8 @@ def page_admin():
     st.sidebar.markdown("### 👑 Меню адміністратора")
     menu = st.sidebar.radio("Розділ", [
         "🛠️ Конструктор подій", "📥 Модерація заявок", "⚖️ Журі", "🧑‍🏫 Ментори",
-        "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд", "🖼️ Портфоліо проєктів"
+        "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд",
+        "🖼️ Портфоліо проєктів", "👤 Мій профіль"
     ])
     if menu == "🛠️ Конструктор подій":
         admin_event_builder()
@@ -3369,6 +3450,8 @@ def page_admin():
         page_leaderboard()
     elif menu == "🖼️ Портфоліо проєктів":
         page_showcase()
+    elif menu == "👤 Мій профіль":
+        page_my_profile()
 
 
 # ============================================================
@@ -3579,7 +3662,7 @@ def participant_office_hours():
 def page_participant():
     st.sidebar.markdown("### 🎓 Меню учасника")
     menu = st.sidebar.radio("Розділ", ["📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
-                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
+                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"])
     if menu == "📅 Календар подій":
         page_calendar()
     elif menu == "🚀 Моя команда":
@@ -3592,6 +3675,8 @@ def page_participant():
         page_showcase()
     elif menu == "📢 Оголошення":
         page_announcements_view()
+    elif menu == "👤 Профіль":
+        page_my_profile()
 
 
 def page_announcements_view():
@@ -3628,7 +3713,8 @@ def page_announcements_view():
 
 def page_jury():
     st.sidebar.markdown("### ⚖️ Меню журі")
-    menu = st.sidebar.radio("Розділ", ["📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
+    menu = st.sidebar.radio("Розділ", ["📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
+                                        "📢 Оголошення", "👤 Профіль"])
     if menu == "📋 Оцінювання":
         jury_evaluation()
     elif menu == "🏆 Лідерборд":
@@ -3637,6 +3723,8 @@ def page_jury():
         page_showcase()
     elif menu == "📢 Оголошення":
         page_jury_announcements()
+    elif menu == "👤 Профіль":
+        page_my_profile()
 
 
 def jury_evaluation():
@@ -3915,7 +4003,8 @@ def page_jury_announcements():
 
 def page_mentor():
     st.sidebar.markdown("### 🧑‍🏫 Меню ментора")
-    menu = st.sidebar.radio("Розділ", ["🗓️ Мої слоти консультацій", "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення"])
+    menu = st.sidebar.radio("Розділ", ["🗓️ Мої слоти консультацій", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
+                                        "📢 Оголошення", "👤 Профіль"])
     if menu == "🗓️ Мої слоти консультацій":
         mentor_slots_manager()
     elif menu == "🏆 Лідерборд":
@@ -3924,6 +4013,8 @@ def page_mentor():
         page_showcase()
     elif menu == "📢 Оголошення":
         page_mentor_announcements()
+    elif menu == "👤 Профіль":
+        page_my_profile()
 
 
 def _parse_hhmm(text):
