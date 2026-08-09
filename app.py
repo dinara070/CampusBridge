@@ -232,6 +232,12 @@ def init_db():
         location TEXT, is_booked INTEGER DEFAULT 0,
         team_id INTEGER, notes TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS mentor_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_id INTEGER, mentor_id INTEGER, team_id INTEGER,
+        rating INTEGER, comment TEXT, created_at TEXT,
+        UNIQUE(slot_id, team_id)
+    )""")
     c.execute("""CREATE TABLE IF NOT EXISTS showcase_likes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_id INTEGER, voter_key TEXT, created_at TEXT,
@@ -1133,6 +1139,78 @@ def send_announcement_email(team_id, ann_title, ann_body):
 
     execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
                VALUES (?,?,?,?,?,?)""", (team_id, to_email, subject, body, status_result, now()))
+    return status_result
+
+
+def _deliver_generic_email(to_email, subject, body):
+    """Спільна логіка надсилання (або симуляції) листа без прив'язки до команди. Повертає статус."""
+    smtp_cfg = get_smtp_config()
+    status_result = "simulated"
+    if smtp_cfg:
+        try:
+            msg = MIMEText(body, _charset="utf-8")
+            msg["Subject"] = subject
+            from_email = smtp_cfg.get("from_email") or smtp_cfg.get("username", "")
+            msg["From"] = from_email
+            msg["To"] = to_email
+            host = smtp_cfg["host"]
+            port = int(smtp_cfg.get("port", 587))
+            use_tls = bool(smtp_cfg.get("use_tls", True))
+            with smtplib.SMTP(host, port, timeout=10) as server:
+                if use_tls:
+                    server.starttls()
+                if smtp_cfg.get("username"):
+                    server.login(smtp_cfg["username"], smtp_cfg.get("password", ""))
+                server.sendmail(from_email, [to_email], msg.as_string())
+            status_result = "sent"
+        except Exception as e:
+            status_result = f"failed: {e}"
+    return status_result
+
+
+def send_team_invite_email(team_id, to_email):
+    """Надсилає (або симулює) запрошення приєднатися до команди за інвайт-кодом.
+    Повертає 'sent' / 'simulated' / 'failed: ...' / None."""
+    team = query_one("""SELECT t.name, t.invite_code, e.title FROM teams t
+                         JOIN events e ON t.event_id = e.id WHERE t.id=?""", (team_id,))
+    if not team:
+        return None
+    team_name, invite_code, event_title = team
+    subject = f"Запрошення приєднатися до команди «{team_name}» — {event_title}"
+    body = "\n".join([
+        f"Вас запрошують приєднатися до команди «{team_name}» на подію «{event_title}» "
+        "на платформі CampusBridge.", "",
+        f"Інвайт-код команди: {invite_code}", "",
+        "Увійдіть (або зареєструйтеся, якщо у вас ще немає акаунта) і скористайтесь опцією "
+        "«Приєднатись за інвайт-кодом» у розділі «Моя команда».", "",
+        f"— CampusBridge, {MAIN_UNIVERSITY}",
+    ])
+    status_result = _deliver_generic_email(to_email, subject, body)
+    execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+               VALUES (?,?,?,?,?,?)""", (team_id, to_email, subject, body, status_result, now()))
+    return status_result
+
+
+def request_password_reset(username, email):
+    """Якщо логін і пошта збігаються з обліковим записом, генерує й надсилає (або симулює)
+    новий тимчасовий пароль. Завжди повертає generic-статус, щоб не розкривати існування акаунтів."""
+    user = query_one("SELECT id, full_name, email FROM users WHERE username=? AND email=?",
+                      (username.strip(), email.strip()))
+    if not user:
+        return "not_found"
+    uid, full_name, to_email = user
+    temp_pw = gen_code(10)
+    execute("UPDATE users SET password=? WHERE id=?", (hash_pw(temp_pw), uid))
+    subject = "🔑 Тимчасовий пароль для CampusBridge"
+    body = "\n".join([
+        f"Вітаємо, {full_name}!", "",
+        f"Ваш тимчасовий пароль: {temp_pw}", "",
+        "Увійдіть із цим паролем і одразу змініть його у розділі «👤 Профіль» → «🔑 Змінити пароль».", "",
+        f"— CampusBridge, {MAIN_UNIVERSITY}",
+    ])
+    status_result = _deliver_generic_email(to_email, subject, body)
+    execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+               VALUES (?,?,?,?,?,?)""", (None, to_email, subject, body, status_result, now()))
     return status_result
 
 
@@ -2094,7 +2172,7 @@ def page_showcase():
 
 
 def page_login():
-    tab1, tab2 = st.tabs(["Вхід", "Реєстрація учасника"])
+    tab1, tab2, tab3 = st.tabs(["Вхід", "Реєстрація учасника", "🔑 Забули пароль?"])
     with tab1:
         with st.form("login_form"):
             u = st.text_input("Логін")
@@ -2141,6 +2219,24 @@ def page_login():
                         st.success(msg)
                     else:
                         st.error(msg)
+
+    with tab3:
+        st.caption("Введіть логін і пошту, вказані під час реєстрації. Якщо вони збігаються з існуючим "
+                   "обліковим записом, ми одразу згенеруємо новий тимчасовий пароль і надішлемо його на "
+                   "вказану пошту (або зафіксуємо в журналі email, якщо адміністратор ще не налаштував SMTP).")
+        with st.form("forgot_pw_form"):
+            fp_username = st.text_input("Логін")
+            fp_email = st.text_input("Пошта, вказана в акаунті")
+            if st.form_submit_button("Скинути пароль"):
+                if not fp_username.strip() or not fp_email.strip():
+                    st.error("Заповніть обидва поля.")
+                else:
+                    request_password_reset(fp_username, fp_email)
+                    # навмисно однакове повідомлення незалежно від результату —
+                    # щоб не розкривати стороннім, які логіни/пошти існують у системі
+                    st.success("Якщо в системі є обліковий запис із такими логіном і поштою, ми щойно "
+                               "скинули пароль і надіслали новий на вказану адресу. Немає листа? "
+                               "Перевірте правильність даних або зверніться до адміністратора.")
 
 
 # ============================================================
@@ -3796,14 +3892,93 @@ def admin_import_export():
                         st.error(f"Не вдалося відновити базу даних: {e}")
 
 
+def page_admin_dashboard():
+    st.subheader(f"🏠 Вітаємо, {st.session_state.user['full_name'].split(' ')[0]}!")
+    st.caption("Швидкий огляд стану платформи та того, що потребує вашої уваги.")
+
+    events_all = get_events()
+    total_events = len(events_all)
+    total_teams = query_one("SELECT COUNT(*) FROM teams")[0]
+    pending_teams = query_one("SELECT COUNT(*) FROM teams WHERE status='На розгляді'")[0]
+    total_members = query_one("SELECT COUNT(*) FROM team_members")[0]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Подій", total_events)
+    k2.metric("Команд усього", total_teams)
+    k3.metric("⏳ Очікують розгляду", pending_teams)
+    k4.metric("Учасників", total_members)
+
+    st.markdown("---")
+    st.markdown("#### 🔔 Потребує уваги")
+    attention_items = []
+
+    if pending_teams:
+        attention_items.append(("📥", f"**{pending_teams}** заявок команд очікують модерації",
+                                 "Перейдіть у розділ «📥 Модерація заявок»."))
+
+    today = datetime.date.today()
+    if not events_all.empty:
+        for _, ev in events_all.iterrows():
+            pitch_dt = parse_date_flexible(ev.get("pitch_deadline"))
+            if pitch_dt and 0 <= (pitch_dt.date() - today).days <= 7:
+                days_left = (pitch_dt.date() - today).days
+                label = "сьогодні" if days_left == 0 else f"через {days_left} дн."
+                attention_items.append(("🏁", f"Дедлайн пітчингу події «{ev['title']}» — {label} ({ev['pitch_deadline']})",
+                                         "Перевірте готовність журі та менторів."))
+            if ev.get("max_teams") and ev["status"] == "Реєстрація відкрита":
+                cnt = query_one("SELECT COUNT(*) FROM teams WHERE event_id=?", (ev["id"],))[0]
+                if cnt / ev["max_teams"] >= 0.9:
+                    attention_items.append(("📈", f"Подія «{ev['title']}»: заповнено {cnt}/{int(ev['max_teams'])} "
+                                             "місць — реєстрація скоро автозакриється", ""))
+
+    for _, ev in events_all.iterrows() if not events_all.empty else []:
+        anomalies = detect_anomalies(int(ev["id"]))
+        if not anomalies.empty:
+            attention_items.append(("⚠️", f"У події «{ev['title']}» виявлено {len(anomalies)} аномальних оцінок",
+                                     "Перевірте в «📊 Аналітика та звіти» → «Оцінювання»."))
+
+    if not attention_items:
+        st.success("✅ Наразі нічого термінового не потребує вашої уваги.")
+    else:
+        for icon, text, hint in attention_items[:10]:
+            with st.container(border=True):
+                st.markdown(f"{icon} {text}")
+                if hint:
+                    st.caption(hint)
+
+    st.markdown("---")
+    st.markdown("#### 🕓 Останні дії на платформі")
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        st.markdown("**Нещодавно змінені статуси заявок**")
+        recent_status = query_df("""SELECT changed_at, new_status, changed_by_name FROM team_status_log
+                                     ORDER BY changed_at DESC LIMIT 5""")
+        if recent_status.empty:
+            st.caption("Ще не було змін статусів.")
+        else:
+            for _, r in recent_status.iterrows():
+                st.caption(f"{r['changed_at'][:16]} · → «{r['new_status']}» ({r['changed_by_name'] or '—'})")
+    with ac2:
+        st.markdown("**Останні подані проєкти**")
+        recent_subs = query_df("""SELECT s.updated_at, t.name AS team FROM submissions s
+                                   JOIN teams t ON s.team_id=t.id ORDER BY s.updated_at DESC LIMIT 5""")
+        if recent_subs.empty:
+            st.caption("Подач ще не було.")
+        else:
+            for _, r in recent_subs.iterrows():
+                st.caption(f"{r['updated_at'][:16]} · «{r['team']}»")
+
+
 def page_admin():
     st.sidebar.markdown("### 👑 Меню адміністратора")
     menu = st.sidebar.radio("Розділ", [
-        "🛠️ Конструктор подій", "📥 Модерація заявок", "⚖️ Журі", "🧑‍🏫 Ментори",
+        "🏠 Дашборд", "🛠️ Конструктор подій", "📥 Модерація заявок", "⚖️ Журі", "🧑‍🏫 Ментори",
         "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд",
         "🖼️ Портфоліо проєктів", "👤 Мій профіль"
     ])
-    if menu == "🛠️ Конструктор подій":
+    if menu == "🏠 Дашборд":
+        page_admin_dashboard()
+    elif menu == "🛠️ Конструктор подій":
         admin_event_builder()
     elif menu == "📥 Модерація заявок":
         admin_team_moderation()
@@ -3932,6 +4107,25 @@ def participant_my_team():
                     st.caption(f"Коментар журі/адміністратора: {t['status_comment']}")
                 st.write(f"Інвайт-код для запрошення: `{t['invite_code']}`")
 
+                with st.expander("📧 Запросити учасника на email"):
+                    st.caption("Надішле інвайт-код на вказану пошту — зручно, якщо не хочете передавати "
+                               "код повідомленням вручну.")
+                    invite_cols = st.columns([3, 1])
+                    with invite_cols[0]:
+                        invite_email = st.text_input("Email запрошеного", key=f"invite_email_{t['id']}",
+                                                       label_visibility="collapsed",
+                                                       placeholder="friend@vspu.edu.ua")
+                    with invite_cols[1]:
+                        if st.button("Надіслати", key=f"invite_send_{t['id']}") and invite_email.strip():
+                            inv_status = send_team_invite_email(int(t["id"]), invite_email.strip())
+                            if inv_status == "sent":
+                                st.success("Запрошення реально надіслано на пошту.")
+                            elif inv_status == "simulated":
+                                st.info("SMTP ще не налаштовано — запрошення симульовано. "
+                                        "Передайте інвайт-код вручну або попросіть адміністратора налаштувати SMTP.")
+                            elif inv_status and inv_status.startswith("failed"):
+                                st.warning(f"Не вдалося надіслати: {inv_status}")
+
                 members_full = query_df("""SELECT tm.id AS membership_id, u.id AS user_id, u.full_name, u.email
                                             FROM team_members tm JOIN users u ON tm.user_id=u.id
                                             WHERE tm.team_id=? ORDER BY tm.id""", (t["id"],))
@@ -4032,53 +4226,146 @@ def participant_office_hours():
     team_row = my_teams[my_teams["id"] == team_id].iloc[0]
     event_id = int(team_row["event_id"])
 
-    my_booking = query_df("""SELECT ms.id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
-                                     ms.location, ms.notes
-                              FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
-                              WHERE ms.team_id=? AND ms.event_id=?""", (team_id, event_id))
+    today_str = str(datetime.date.today())
+    all_bookings = query_df("""SELECT ms.id, ms.mentor_id, u.full_name AS mentor, ms.slot_date, ms.start_time,
+                                       ms.end_time, ms.location, ms.notes
+                                FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
+                                WHERE ms.team_id=? AND ms.event_id=?
+                                ORDER BY ms.slot_date DESC, ms.start_time DESC""", (team_id, event_id))
 
-    if not my_booking.empty:
-        st.success("✅ У вашої команди вже є записана консультація:")
-        st.dataframe(my_booking, use_container_width=True, hide_index=True)
-        cancel_id = int(my_booking.iloc[0]["id"])
+    active_booking = all_bookings[all_bookings["slot_date"] >= today_str] if not all_bookings.empty else all_bookings
+    past_bookings = all_bookings[all_bookings["slot_date"] < today_str] if not all_bookings.empty else all_bookings
+
+    if not active_booking.empty:
+        row = active_booking.iloc[0]
+        st.success(f"✅ У вашої команди вже є записана консультація: **{row['mentor']}** · "
+                   f"{row['slot_date']} {row['start_time']}–{row['end_time']} · {row['location'] or 'онлайн'}")
+        if row["notes"]:
+            st.caption(f"📝 {row['notes']}")
         if st.button("Скасувати запис"):
-            execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE id=?", (cancel_id,))
+            execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE id=?", (int(row["id"]),))
             st.success("Запис скасовано, слот знову вільний.")
             st.rerun()
-        return
-
-    st.markdown("#### Вільні слоти для консультацій перед пітчингом")
-    free_slots = query_df("""SELECT ms.id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
-                                     ms.location
-                              FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
-                              WHERE ms.event_id=? AND ms.is_booked=0
-                              ORDER BY ms.slot_date, ms.start_time""", (event_id,))
-    if free_slots.empty:
-        st.info("Наразі немає вільних слотів для цієї події. Спробуйте пізніше.")
-        return
-
-    st.dataframe(free_slots, use_container_width=True, hide_index=True)
-    slot_map = {
-        f"{row['mentor']} · {row['slot_date']} {row['start_time']}–{row['end_time']} ({row['location'] or 'онлайн'})": row["id"]
-        for _, row in free_slots.iterrows()
-    }
-    chosen = st.selectbox("Оберіть слот", list(slot_map.keys()))
-    if st.button("📌 Записатись на консультацію"):
-        slot_id = int(slot_map[chosen])
-        current = query_one("SELECT is_booked FROM mentor_slots WHERE id=?", (slot_id,))
-        if current and current[0] == 1:
-            st.error("На жаль, цей слот щойно зайняли. Оберіть інший.")
+    else:
+        st.markdown("#### Вільні слоти для консультацій перед пітчингом")
+        free_slots = query_df("""SELECT ms.id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
+                                         ms.location
+                                  FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
+                                  WHERE ms.event_id=? AND ms.is_booked=0 AND ms.slot_date >= ?
+                                  ORDER BY ms.slot_date, ms.start_time""", (event_id, today_str))
+        if free_slots.empty:
+            st.info("Наразі немає вільних слотів для цієї події. Спробуйте пізніше.")
         else:
-            execute("UPDATE mentor_slots SET is_booked=1, team_id=? WHERE id=?", (team_id, slot_id))
-            st.success("Вас записано на консультацію!")
-            st.rerun()
+            st.dataframe(free_slots, use_container_width=True, hide_index=True)
+            slot_map = {
+                f"{row['mentor']} · {row['slot_date']} {row['start_time']}–{row['end_time']} "
+                f"({row['location'] or 'онлайн'})": row["id"]
+                for _, row in free_slots.iterrows()
+            }
+            chosen = st.selectbox("Оберіть слот", list(slot_map.keys()))
+            if st.button("📌 Записатись на консультацію"):
+                slot_id = int(slot_map[chosen])
+                current = query_one("SELECT is_booked FROM mentor_slots WHERE id=?", (slot_id,))
+                if current and current[0] == 1:
+                    st.error("На жаль, цей слот щойно зайняли. Оберіть інший.")
+                else:
+                    execute("UPDATE mentor_slots SET is_booked=1, team_id=? WHERE id=?", (team_id, slot_id))
+                    st.success("Вас записано на консультацію!")
+                    st.rerun()
+
+    # ------------------------------------------------------------
+    # Минулі консультації + оцінювання ментора
+    # ------------------------------------------------------------
+    if not past_bookings.empty:
+        st.markdown("---")
+        st.markdown("#### 📜 Минулі консультації")
+        for _, pb in past_bookings.iterrows():
+            with st.container(border=True):
+                st.write(f"**{pb['mentor']}** · {pb['slot_date']} {pb['start_time']}–{pb['end_time']} "
+                         f"· {pb['location'] or 'онлайн'}")
+                existing_fb = query_one("""SELECT rating, comment FROM mentor_feedback
+                                            WHERE slot_id=? AND team_id=?""", (int(pb["id"]), team_id))
+                if existing_fb:
+                    stars = "⭐" * int(existing_fb[0]) + "☆" * (5 - int(existing_fb[0]))
+                    st.write(f"Ваша оцінка: {stars}")
+                    if existing_fb[1]:
+                        st.caption(f"💬 {existing_fb[1]}")
+                else:
+                    with st.form(f"rate_mentor_form_{pb['id']}"):
+                        rating = st.slider("Оцініть консультацію", min_value=1, max_value=5, value=5,
+                                            key=f"rating_{pb['id']}")
+                        comment = st.text_area("Коментар (необов'язково)", key=f"rating_comment_{pb['id']}")
+                        if st.form_submit_button("⭐ Залишити відгук"):
+                            execute("""INSERT INTO mentor_feedback (slot_id,mentor_id,team_id,rating,comment,created_at)
+                                       VALUES (?,?,?,?,?,?)""",
+                                    (int(pb["id"]), int(pb["mentor_id"]), team_id, rating, comment, now()))
+                            st.success("Дякуємо за відгук!")
+                            st.rerun()
+
+
+def page_participant_dashboard():
+    user = st.session_state.user
+    st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
+
+    my_teams = query_df("""SELECT t.*, e.title AS event_title, e.pitch_deadline, e.event_start
+                            FROM teams t JOIN team_members tm ON t.id=tm.team_id
+                            JOIN events e ON t.event_id=e.id WHERE tm.user_id=?""", (user["id"],))
+    if my_teams.empty:
+        st.info("Ви ще не в жодній команді. Перейдіть у «🚀 Моя команда», щоб створити команду або "
+                "приєднатися за інвайт-кодом.")
+    else:
+        today = datetime.date.today()
+        status_colors = {"Прийнято": "green", "Відхилено": "red",
+                          "Потребує доопрацювання": "orange", "На розгляді": "blue"}
+        for _, t in my_teams.iterrows():
+            with st.container(border=True):
+                st.markdown(f"### {t['name']} · {t['event_title']}")
+                st.markdown(f":{status_colors.get(t['status'], 'gray')}[**Статус: {t['status']}**]")
+                has_sub = query_one("SELECT COUNT(*) FROM submissions WHERE team_id=?", (t["id"],))[0] > 0
+                st.write("📦 Проєкт: " + ("подано ✅" if has_sub else "ще не завантажено ⚠️"))
+
+                pitch_dt = parse_date_flexible(t.get("pitch_deadline"))
+                if pitch_dt:
+                    days_left = (pitch_dt.date() - today).days
+                    if days_left > 0:
+                        st.caption(f"🏁 До дедлайну пітчингу лишилось {days_left} дн. ({t['pitch_deadline']})")
+                    elif days_left == 0:
+                        st.caption("🏁 Дедлайн пітчингу — сьогодні!")
+                    else:
+                        st.caption(f"🏁 Дедлайн пітчингу минув ({t['pitch_deadline']})")
+
+    st.markdown("---")
+    my_booking = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time, u.full_name AS mentor
+                              FROM mentor_slots ms JOIN team_members tm ON tm.team_id=ms.team_id
+                              JOIN users u ON ms.mentor_id=u.id
+                              WHERE tm.user_id=? AND ms.is_booked=1
+                              ORDER BY ms.slot_date LIMIT 1""", (user["id"],))
+    if not my_booking.empty:
+        b = my_booking.iloc[0]
+        st.info(f"🗓️ Найближча консультація: **{b['slot_date']} {b['start_time']}–{b['end_time']}** з {b['mentor']}")
+
+    st.markdown("#### 📢 Останнє оголошення")
+    latest_ann = query_df("""SELECT created_at, title, body, COALESCE(priority,'Звичайне') AS priority
+                              FROM announcements WHERE target_team_id IS NULL
+                              ORDER BY created_at DESC LIMIT 1""")
+    if latest_ann.empty:
+        st.caption("Оголошень поки немає.")
+    else:
+        a = latest_ann.iloc[0]
+        badge = "⭐ " if a["priority"] == "⭐ Важливе" else ""
+        with st.container(border=True):
+            st.markdown(f"**{badge}{a['title']}**")
+            st.caption(a["created_at"][:16])
+            st.write(a["body"])
 
 
 def page_participant():
     st.sidebar.markdown("### 🎓 Меню учасника")
-    menu = st.sidebar.radio("Розділ", ["📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
+    menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
                                         "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"])
-    if menu == "📅 Календар подій":
+    if menu == "🏠 Дашборд":
+        page_participant_dashboard()
+    elif menu == "📅 Календар подій":
         page_calendar()
     elif menu == "🚀 Моя команда":
         participant_my_team()
@@ -4126,11 +4413,67 @@ def page_announcements_view():
 # ЖУРІ / ЕКСПЕРТ
 # ============================================================
 
+def page_jury_dashboard():
+    user = st.session_state.user
+    st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
+
+    assignments = query_df("""SELECT DISTINCT ja.event_id, e.title AS event_title
+                               FROM jury_assignments ja JOIN events e ON ja.event_id=e.id
+                               WHERE ja.jury_id=?""", (user["id"],))
+    if assignments.empty:
+        st.info("Вам ще не призначено подій для оцінювання. Зверніться до організаторів.")
+        return
+
+    total_scored, total_scorable = 0, 0
+    rows = []
+    for _, a in assignments.iterrows():
+        eid = int(a["event_id"])
+        crit_count = query_one("SELECT COUNT(*) FROM criteria WHERE event_id=?", (eid,))[0]
+        avoid_conflict = query_one("SELECT avoid_conflict FROM events WHERE id=?", (eid,))[0]
+        teams_ev = query_df("SELECT id, faculty FROM teams WHERE event_id=? AND status='Прийнято'", (eid,))
+        if avoid_conflict:
+            teams_ev = teams_ev[teams_ev["faculty"] != user.get("faculty")]
+        total = len(teams_ev)
+        scored = 0
+        for _, tt in teams_ev.iterrows():
+            cnt = query_one("SELECT COUNT(DISTINCT criterion_id) FROM scores WHERE team_id=? AND jury_id=?",
+                             (int(tt["id"]), user["id"]))[0]
+            if crit_count and cnt >= crit_count:
+                scored += 1
+        total_scored += scored
+        total_scorable += total
+        rows.append({"event": a["event_title"], "total": total, "scored": scored})
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Подій призначено", len(assignments))
+    k2.metric("Оцінено команд", f"{total_scored}/{total_scorable}" if total_scorable else "0/0")
+    pct = round(total_scored / total_scorable * 100, 1) if total_scorable else 0
+    k3.metric("Загальний прогрес", f"{pct}%")
+    st.progress(min(pct / 100, 1.0))
+
+    st.markdown("---")
+    st.markdown("#### 📋 Прогрес за подіями")
+    for r in rows:
+        with st.container(border=True):
+            done = r["total"] > 0 and r["scored"] >= r["total"]
+            icon = "✅" if done else "🕓"
+            st.markdown(f"{icon} **{r['event']}** — {r['scored']}/{r['total']} команд оцінено")
+            if r["total"]:
+                st.progress(min(r["scored"] / r["total"], 1.0))
+    if total_scorable and total_scored < total_scorable:
+        st.warning(f"⏳ Вам ще залишилось оцінити {total_scorable - total_scored} команд(и). "
+                   "Перейдіть у розділ «📋 Оцінювання».")
+    elif total_scorable:
+        st.success("✅ Ви завершили оцінювання всіх призначених вам команд!")
+
+
 def page_jury():
     st.sidebar.markdown("### ⚖️ Меню журі")
-    menu = st.sidebar.radio("Розділ", ["📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
+    menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
                                         "📢 Оголошення", "👤 Профіль"])
-    if menu == "📋 Оцінювання":
+    if menu == "🏠 Дашборд":
+        page_jury_dashboard()
+    elif menu == "📋 Оцінювання":
         jury_evaluation()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
@@ -4431,11 +4774,53 @@ def page_jury_announcements():
 # МЕНТОР (OFFICE HOURS)
 # ============================================================
 
+def page_mentor_dashboard():
+    user = st.session_state.user
+    st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
+
+    all_slots = query_df("""SELECT ms.*, e.title AS event_title FROM mentor_slots ms
+                             JOIN events e ON ms.event_id=e.id WHERE ms.mentor_id=?""", (user["id"],))
+    if all_slots.empty:
+        st.info("У вас ще немає жодного слоту консультацій. Перейдіть у «🗓️ Мої слоти консультацій», "
+                "щоб додати їх.")
+        return
+
+    total = len(all_slots)
+    booked = int((all_slots["is_booked"] == 1).sum())
+    free = total - booked
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Слотів усього", total)
+    k2.metric("Заброньовано", booked)
+    k3.metric("Вільно", free)
+
+    today_str = str(datetime.date.today())
+    upcoming = all_slots[(all_slots["is_booked"] == 1) & (all_slots["slot_date"] >= today_str)].sort_values("slot_date")
+    st.markdown("---")
+    st.markdown("#### 🔔 Найближчі консультації")
+    if upcoming.empty:
+        st.caption("Немає майбутніх заброньованих консультацій.")
+    else:
+        for _, s in upcoming.head(5).iterrows():
+            contact = query_one("""SELECT u.full_name, u.email FROM teams t
+                                    LEFT JOIN users u ON t.captain_id=u.id WHERE t.id=?""", (int(s["team_id"]),)) \
+                if s["team_id"] else None
+            team_name = query_one("SELECT name FROM teams WHERE id=?", (int(s["team_id"]),))[0] if s["team_id"] else "—"
+            contact_str = f" · 📧 {contact[1]}" if contact and contact[1] else ""
+            st.info(f"**{s['slot_date']} {s['start_time']}–{s['end_time']}** · {s['event_title']} · "
+                    f"команда «{team_name}»{contact_str}")
+
+    upcoming_free = all_slots[(all_slots["is_booked"] == 0) & (all_slots["slot_date"] >= today_str)]
+    if not upcoming_free.empty:
+        st.caption(f"🟢 У вас ще є {len(upcoming_free)} вільних майбутніх слотів, які команди можуть забронювати.")
+
+
 def page_mentor():
     st.sidebar.markdown("### 🧑‍🏫 Меню ментора")
-    menu = st.sidebar.radio("Розділ", ["🗓️ Мої слоти консультацій", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
-                                        "📢 Оголошення", "👤 Профіль"])
-    if menu == "🗓️ Мої слоти консультацій":
+    menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "🗓️ Мої слоти консультацій", "🏆 Лідерборд",
+                                        "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"])
+    if menu == "🏠 Дашборд":
+        page_mentor_dashboard()
+    elif menu == "🗓️ Мої слоти консультацій":
         mentor_slots_manager()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
@@ -4705,6 +5090,29 @@ def mentor_slots_manager():
                 st.altair_chart(chart_date, use_container_width=True)
             else:
                 st.caption("Заброньованих слотів поки немає.")
+
+            st.markdown("---")
+            st.markdown("#### ⭐ Відгуки про консультації")
+            my_feedback = query_df("""SELECT mf.created_at, mf.rating, mf.comment, t.name AS team, e.title AS event
+                                       FROM mentor_feedback mf
+                                       LEFT JOIN teams t ON mf.team_id = t.id
+                                       JOIN mentor_slots ms ON mf.slot_id = ms.id
+                                       JOIN events e ON ms.event_id = e.id
+                                       WHERE mf.mentor_id=? ORDER BY mf.created_at DESC""", (user["id"],))
+            if my_feedback.empty:
+                st.caption("Відгуків від учасників ще не було.")
+            else:
+                avg_rating = round(my_feedback["rating"].mean(), 2)
+                fc1, fc2 = st.columns(2)
+                fc1.metric("Середня оцінка", f"{avg_rating} / 5")
+                fc2.metric("Кількість відгуків", len(my_feedback))
+                for _, fb in my_feedback.iterrows():
+                    stars = "⭐" * int(fb["rating"]) + "☆" * (5 - int(fb["rating"]))
+                    with st.container(border=True):
+                        st.write(f"{stars} · {fb['team']} · {fb['event']}")
+                        if fb["comment"]:
+                            st.caption(f"💬 {fb['comment']}")
+                        st.caption(fb["created_at"][:16])
 
 
 def page_mentor_announcements():
