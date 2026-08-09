@@ -3917,6 +3917,7 @@ def page_admin_dashboard():
                                  "Перейдіть у розділ «📥 Модерація заявок»."))
 
     today = datetime.date.today()
+    upcoming_milestones = []
     if not events_all.empty:
         for _, ev in events_all.iterrows():
             pitch_dt = parse_date_flexible(ev.get("pitch_deadline"))
@@ -3930,6 +3931,11 @@ def page_admin_dashboard():
                 if cnt / ev["max_teams"] >= 0.9:
                     attention_items.append(("📈", f"Подія «{ev['title']}»: заповнено {cnt}/{int(ev['max_teams'])} "
                                              "місць — реєстрація скоро автозакриється", ""))
+            for label, date_str in [("Старт реєстрації", ev.get("reg_start")), ("Кінець реєстрації", ev.get("reg_end")),
+                                     ("Старт події", ev.get("event_start")), ("Пітчинг", ev.get("pitch_deadline"))]:
+                dt = parse_date_flexible(date_str)
+                if dt and 0 <= (dt.date() - today).days <= 14:
+                    upcoming_milestones.append({"Дата": dt.date(), "Подія": ev["title"], "Етап": label})
 
     for _, ev in events_all.iterrows() if not events_all.empty else []:
         anomalies = detect_anomalies(int(ev["id"]))
@@ -3945,6 +3951,86 @@ def page_admin_dashboard():
                 st.markdown(f"{icon} {text}")
                 if hint:
                     st.caption(hint)
+
+    if upcoming_milestones:
+        st.markdown("#### 🗓️ Найближчі 14 днів")
+        milestones_df = pd.DataFrame(upcoming_milestones).sort_values("Дата")
+        st.dataframe(milestones_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### 📊 Динаміка та розподіл")
+    dc1, dc2 = st.columns(2)
+    teams_all_dash = query_df("""SELECT t.*, e.category AS event_category FROM teams t
+                                  JOIN events e ON t.event_id=e.id""")
+    with dc1:
+        st.markdown("**Реєстрації команд за останні 14 днів**")
+        if not teams_all_dash.empty:
+            trend_df = teams_all_dash.copy()
+            trend_df["Дата"] = trend_df["created_at"].apply(_parse_created_date)
+            trend_df = trend_df.dropna(subset=["Дата"])
+            trend_df = trend_df[trend_df["Дата"] >= (today - timedelta(days=14))]
+            if not trend_df.empty:
+                daily = trend_df.groupby("Дата").size().reset_index(name="Нових команд")
+                chart = alt.Chart(daily).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                    x=alt.X("Дата:T"), y=alt.Y("Нових команд:Q"),
+                    color=alt.value("#4F8BF9"), tooltip=["Дата:T", "Нових команд:Q"],
+                ).properties(height=240)
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.caption("За останні 14 днів нових реєстрацій не було.")
+        else:
+            st.caption("Команд ще немає.")
+    with dc2:
+        st.markdown("**Заявки за статусами (усі події)**")
+        if not teams_all_dash.empty:
+            status_counts = teams_all_dash.groupby("status").size().reindex(TEAM_STATUSES).fillna(0).reset_index()
+            status_counts.columns = ["Статус", "Команд"]
+            donut = alt.Chart(status_counts).mark_arc(innerRadius=55).encode(
+                theta=alt.Theta("Команд:Q"),
+                color=alt.Color("Статус:N", scale=alt.Scale(domain=TEAM_STATUSES,
+                                 range=["#4F8BF9", "#27AE60", "#F1C40F", "#E74C3C"])),
+                tooltip=["Статус", "Команд"],
+            ).properties(height=240)
+            st.altair_chart(donut, use_container_width=True)
+        else:
+            st.caption("Команд ще немає.")
+
+    st.markdown("#### 👥 Навантаження команди організаторів")
+    oc1, oc2 = st.columns(2)
+    with oc1:
+        n_jury = query_one("SELECT COUNT(*) FROM users WHERE role='jury'")[0]
+        jury_progress = query_df("""SELECT ja.jury_id, ja.event_id FROM jury_assignments ja""")
+        avg_jury_pct = None
+        if not jury_progress.empty:
+            pct_list = []
+            for _, row in jury_progress.drop_duplicates().iterrows():
+                crit_count = query_one("SELECT COUNT(*) FROM criteria WHERE event_id=?", (int(row["event_id"]),))[0]
+                teams_ev = query_df("SELECT id FROM teams WHERE event_id=? AND status='Прийнято'", (int(row["event_id"]),))
+                if teams_ev.empty or not crit_count:
+                    continue
+                scored = 0
+                for _, tt in teams_ev.iterrows():
+                    cnt = query_one("SELECT COUNT(DISTINCT criterion_id) FROM scores WHERE team_id=? AND jury_id=?",
+                                     (int(tt["id"]), int(row["jury_id"])))[0]
+                    if cnt >= crit_count:
+                        scored += 1
+                pct_list.append(scored / len(teams_ev) * 100)
+            avg_jury_pct = round(sum(pct_list) / len(pct_list), 1) if pct_list else 0
+        st.metric("Журі в системі", n_jury)
+        if avg_jury_pct is not None:
+            st.metric("Середній прогрес оцінювання", f"{avg_jury_pct}%")
+            st.progress(min(avg_jury_pct / 100, 1.0))
+    with oc2:
+        n_mentors = query_one("SELECT COUNT(*) FROM users WHERE role='mentor'")[0]
+        total_slots_all = query_one("SELECT COUNT(*) FROM mentor_slots")[0]
+        booked_slots_all = query_one("SELECT COUNT(*) FROM mentor_slots WHERE is_booked=1")[0]
+        st.metric("Менторів у системі", n_mentors)
+        if total_slots_all:
+            occ_pct = round(booked_slots_all / total_slots_all * 100, 1)
+            st.metric("Заповненість Office Hours", f"{occ_pct}%")
+            st.progress(min(occ_pct / 100, 1.0))
+        else:
+            st.caption("Слотів консультацій ще не створено.")
 
     st.markdown("---")
     st.markdown("#### 🕓 Останні дії на платформі")
@@ -4307,7 +4393,8 @@ def page_participant_dashboard():
     user = st.session_state.user
     st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
 
-    my_teams = query_df("""SELECT t.*, e.title AS event_title, e.pitch_deadline, e.event_start
+    my_teams = query_df("""SELECT t.*, e.title AS event_title, e.pitch_deadline, e.event_start,
+                                   e.min_team, e.max_team, e.leaderboard_live
                             FROM teams t JOIN team_members tm ON t.id=tm.team_id
                             JOIN events e ON t.event_id=e.id WHERE tm.user_id=?""", (user["id"],))
     if my_teams.empty:
@@ -4321,8 +4408,22 @@ def page_participant_dashboard():
             with st.container(border=True):
                 st.markdown(f"### {t['name']} · {t['event_title']}")
                 st.markdown(f":{status_colors.get(t['status'], 'gray')}[**Статус: {t['status']}**]")
+
+                n_members = query_one("SELECT COUNT(*) FROM team_members WHERE team_id=?", (t["id"],))[0]
                 has_sub = query_one("SELECT COUNT(*) FROM submissions WHERE team_id=?", (t["id"],))[0] > 0
-                st.write("📦 Проєкт: " + ("подано ✅" if has_sub else "ще не завантажено ⚠️"))
+                has_booking = query_one("SELECT COUNT(*) FROM mentor_slots WHERE team_id=? AND is_booked=1",
+                                         (t["id"],))[0] > 0
+                team_ok_size = (t["min_team"] or 1) <= n_members
+
+                st.markdown("**✅ Чек-лист готовності:**")
+                cl1, cl2, cl3 = st.columns(3)
+                with cl1:
+                    st.write(("✅" if team_ok_size else "⚠️") +
+                             f" Склад команди: {n_members} (мін. {int(t['min_team'] or 1)}, макс. {int(t['max_team'] or 1)})")
+                with cl2:
+                    st.write(("✅ Проєкт подано" if has_sub else "⚠️ Проєкт ще не подано"))
+                with cl3:
+                    st.write(("✅ Консультацію заброньовано" if has_booking else "◻️ Консультацію не заброньовано"))
 
                 pitch_dt = parse_date_flexible(t.get("pitch_deadline"))
                 if pitch_dt:
@@ -4334,6 +4435,13 @@ def page_participant_dashboard():
                     else:
                         st.caption(f"🏁 Дедлайн пітчингу минув ({t['pitch_deadline']})")
 
+                if t["status"] == "Прийнято" and t["leaderboard_live"]:
+                    my_score = compute_team_score(int(t["id"]))
+                    if my_score is not None:
+                        st.metric("⭐ Ваш поточний бал", my_score)
+                    else:
+                        st.caption("Оцінки журі ще не виставлено.")
+
     st.markdown("---")
     my_booking = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time, u.full_name AS mentor
                               FROM mentor_slots ms JOIN team_members tm ON tm.team_id=ms.team_id
@@ -4343,6 +4451,15 @@ def page_participant_dashboard():
     if not my_booking.empty:
         b = my_booking.iloc[0]
         st.info(f"🗓️ Найближча консультація: **{b['slot_date']} {b['start_time']}–{b['end_time']}** з {b['mentor']}")
+
+    my_event_ids = my_teams["event_id"].tolist() if not my_teams.empty else []
+    open_events = get_events("Реєстрація відкрита")
+    if not open_events.empty:
+        suggestions = open_events[~open_events["id"].isin(my_event_ids)]
+        if not suggestions.empty:
+            st.markdown("#### 💡 Інші події з відкритою реєстрацією")
+            for _, ev in suggestions.head(3).iterrows():
+                st.caption(f"🎯 **{ev['title']}** · {ev['category']} · реєстрація до {ev['reg_end']}")
 
     st.markdown("#### 📢 Останнє оголошення")
     latest_ann = query_df("""SELECT created_at, title, body, COALESCE(priority,'Звичайне') AS priority
@@ -4417,20 +4534,22 @@ def page_jury_dashboard():
     user = st.session_state.user
     st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
 
-    assignments = query_df("""SELECT DISTINCT ja.event_id, e.title AS event_title
+    assignments = query_df("""SELECT DISTINCT ja.event_id, e.title AS event_title, e.double_blind, e.pitch_deadline
                                FROM jury_assignments ja JOIN events e ON ja.event_id=e.id
                                WHERE ja.jury_id=?""", (user["id"],))
     if assignments.empty:
         st.info("Вам ще не призначено подій для оцінювання. Зверніться до організаторів.")
         return
 
+    today = datetime.date.today()
     total_scored, total_scorable = 0, 0
     rows = []
+    unscored_teams = []
     for _, a in assignments.iterrows():
         eid = int(a["event_id"])
         crit_count = query_one("SELECT COUNT(*) FROM criteria WHERE event_id=?", (eid,))[0]
         avoid_conflict = query_one("SELECT avoid_conflict FROM events WHERE id=?", (eid,))[0]
-        teams_ev = query_df("SELECT id, faculty FROM teams WHERE event_id=? AND status='Прийнято'", (eid,))
+        teams_ev = query_df("SELECT id, name, faculty FROM teams WHERE event_id=? AND status='Прийнято'", (eid,))
         if avoid_conflict:
             teams_ev = teams_ev[teams_ev["faculty"] != user.get("faculty")]
         total = len(teams_ev)
@@ -4440,6 +4559,9 @@ def page_jury_dashboard():
                              (int(tt["id"]), user["id"]))[0]
             if crit_count and cnt >= crit_count:
                 scored += 1
+            else:
+                name = anon_code(int(tt["id"])) if a["double_blind"] else tt["name"]
+                unscored_teams.append({"event": a["event_title"], "team": name})
         total_scored += scored
         total_scorable += total
         rows.append({"event": a["event_title"], "total": total, "scored": scored})
@@ -4465,6 +4587,50 @@ def page_jury_dashboard():
                    "Перейдіть у розділ «📋 Оцінювання».")
     elif total_scorable:
         st.success("✅ Ви завершили оцінювання всіх призначених вам команд!")
+
+    if unscored_teams:
+        st.markdown("#### ⏭️ Наступні команди для оцінювання")
+        for item in unscored_teams[:8]:
+            st.caption(f"🕓 «{item['team']}» · {item['event']}")
+
+    pitch_rows = []
+    for _, a in assignments.iterrows():
+        pitch_dt = parse_date_flexible(a.get("pitch_deadline"))
+        if pitch_dt:
+            days_left = (pitch_dt.date() - today).days
+            if days_left >= 0:
+                pitch_rows.append((a["event_title"], days_left, a["pitch_deadline"]))
+    if pitch_rows:
+        st.markdown("#### 🏁 Дедлайни пітчингу подій, які ви оцінюєте")
+        for ev_title, days_left, date_str in sorted(pitch_rows, key=lambda x: x[1]):
+            label = "сьогодні" if days_left == 0 else f"через {days_left} дн."
+            st.caption(f"«{ev_title}» — {label} ({date_str})")
+
+    if total_scored:
+        st.markdown("---")
+        st.markdown("#### 🎯 Самоаналіз калібрування")
+        my_avgs, overall_avgs = [], []
+        for _, a in assignments.iterrows():
+            eid = int(a["event_id"])
+            teams_ev = query_df("SELECT id FROM teams WHERE event_id=? AND status='Прийнято'", (eid,))
+            for _, tt in teams_ev.iterrows():
+                ms = compute_team_score_for_jury(int(tt["id"]), user["id"])
+                os_ = compute_team_score(int(tt["id"]))
+                if ms is not None and os_ is not None:
+                    my_avgs.append(ms)
+                    overall_avgs.append(os_)
+        if my_avgs:
+            my_mean = round(sum(my_avgs) / len(my_avgs), 1)
+            overall_mean = round(sum(overall_avgs) / len(overall_avgs), 1)
+            diff = round(my_mean - overall_mean, 1)
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Мій середній бал", my_mean)
+            cc2.metric("Загальний середній", overall_mean)
+            cc3.metric("Різниця", f"{'+' if diff > 0 else ''}{diff}")
+            if abs(diff) >= 10:
+                tone = "суворіше" if diff < 0 else "м'якше"
+                st.caption(f"ℹ️ Ваші оцінки в середньому {tone}, ніж у колег по журі — це нормально, "
+                           "але варто звернути увагу під час подальшого оцінювання.")
 
 
 def page_jury():
@@ -4812,6 +4978,50 @@ def page_mentor_dashboard():
     upcoming_free = all_slots[(all_slots["is_booked"] == 0) & (all_slots["slot_date"] >= today_str)]
     if not upcoming_free.empty:
         st.caption(f"🟢 У вас ще є {len(upcoming_free)} вільних майбутніх слотів, які команди можуть забронювати.")
+
+    st.markdown("---")
+    occ_pct = round(booked / total * 100, 1) if total else 0
+    st.markdown(f"#### 📊 Заповненість слотів: {occ_pct}%")
+    st.progress(min(occ_pct / 100, 1.0))
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.markdown("**Слотів за подіями**")
+        by_ev = all_slots.groupby("event_title").size().reset_index(name="Слотів")
+        chart_ev = alt.Chart(by_ev).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+            x=alt.X("Слотів:Q"), y=alt.Y("event_title:N", sort="-x", title="Подія"),
+            color=alt.Color("Слотів:Q", scale=alt.Scale(scheme="teals"), legend=None),
+            tooltip=["event_title", "Слотів"],
+        ).properties(height=max(160, 32 * len(by_ev)))
+        st.altair_chart(chart_ev, use_container_width=True)
+    with dc2:
+        st.markdown("**Бронювання за датами**")
+        booked_df = all_slots[all_slots["is_booked"] == 1]
+        if not booked_df.empty:
+            by_date = booked_df.groupby("slot_date").size().reset_index(name="Бронювань")
+            chart_date = alt.Chart(by_date).mark_bar().encode(
+                x=alt.X("slot_date:N", title="Дата", sort=None), y=alt.Y("Бронювань:Q"),
+                color=alt.value("#4F8BF9"), tooltip=["slot_date", "Бронювань"],
+            ).properties(height=max(160, 32 * len(by_ev)))
+            st.altair_chart(chart_date, use_container_width=True)
+        else:
+            st.caption("Заброньованих слотів поки немає.")
+
+    events_with_slots = all_slots["event_id"].unique().tolist()
+    no_booking_rows = []
+    for eid in events_with_slots:
+        ev_title_row = query_one("SELECT title FROM events WHERE id=?", (int(eid),))
+        teams_no_slot = query_df("""SELECT t.name, t.faculty FROM teams t
+                                     WHERE t.event_id=? AND t.status='Прийнято'
+                                     AND t.id NOT IN (SELECT team_id FROM mentor_slots
+                                                       WHERE event_id=? AND mentor_id=? AND team_id IS NOT NULL)""",
+                                  (int(eid), int(eid), user["id"]))
+        for _, tt in teams_no_slot.iterrows():
+            no_booking_rows.append({"Подія": ev_title_row[0] if ev_title_row else "—",
+                                     "Команда": tt["name"], "Факультет": tt["faculty"]})
+    if no_booking_rows:
+        st.markdown("#### 📋 Прийняті команди, які ще не бронювали консультацію з вами")
+        st.dataframe(pd.DataFrame(no_booking_rows), use_container_width=True, hide_index=True)
 
 
 def page_mentor():
