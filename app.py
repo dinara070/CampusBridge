@@ -283,6 +283,24 @@ def init_db():
         c.execute("ALTER TABLE announcements ADD COLUMN email_status TEXT")
     conn.commit()
 
+    c.execute("PRAGMA table_info(users)")
+    user_cols = [row[1] for row in c.fetchall()]
+    if "email_opt_in" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN email_opt_in INTEGER DEFAULT 1")
+    conn.commit()
+
+    c.execute("PRAGMA table_info(users)")
+    user_cols = [row[1] for row in c.fetchall()]
+    if "email_opt_in" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN email_opt_in INTEGER DEFAULT 1")
+    conn.commit()
+
+    c.execute("PRAGMA table_info(team_members)")
+    tm_cols = [row[1] for row in c.fetchall()]
+    if "joined_at" not in tm_cols:
+        c.execute("ALTER TABLE team_members ADD COLUMN joined_at TEXT")
+    conn.commit()
+
     c.execute("SELECT COUNT(*) FROM users WHERE role='admin'")
     if c.fetchone()[0] == 0:
         c.execute("""INSERT INTO users
@@ -352,7 +370,8 @@ def init_db():
             (demo_event_id, nom1_id, "AI Вінничани", participant_demo_id, gen_code(), MAIN_FACULTY,
              "Прийнято", "", now()))
         demo_team_id = c.lastrowid
-        c.execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (demo_team_id, participant_demo_id))
+        c.execute("INSERT INTO team_members (team_id,user_id,joined_at) VALUES (?,?,?)",
+                   (demo_team_id, participant_demo_id, now()))
         c.execute("""INSERT INTO submissions (team_id,repo_link,presentation_link,video_link,description,
             version,updated_at,tags) VALUES (?,?,?,?,?,?,?,?)""",
             (demo_team_id, "https://github.com/campusbridge/demo-ai-assistant", "",
@@ -510,7 +529,7 @@ def authenticate(username, password):
                      (username, hash_pw(password)))
     if row:
         cols = ["id", "username", "password", "role", "full_name", "email",
-                "university", "faculty", "created_at"]
+                "university", "faculty", "created_at", "email_opt_in"]
         return dict(zip(cols, row))
     return None
 
@@ -966,10 +985,17 @@ def send_status_email(team_id, new_status, comment):
     if not captain_id:
         return None  # команда без капітана (наприклад, імпортована вручну) — надсилати нікому
 
-    captain = query_one("SELECT full_name, email FROM users WHERE id=?", (captain_id,))
+    captain = query_one("SELECT full_name, email, email_opt_in FROM users WHERE id=?", (captain_id,))
     if not captain or not captain[1]:
         return None
-    captain_name, to_email = captain
+    captain_name, to_email, opt_in = captain
+    if opt_in == 0:
+        execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (team_id, to_email, tmpl["subject"].format(team=team_name, event=event_title),
+                 "(лист не сформовано — отримувач вимкнув email-сповіщення у профілі)",
+                 "skipped_opt_out", now()))
+        return "skipped_opt_out"
 
     subject = tmpl["subject"].format(team=team_name, event=event_title)
     body_lines = [f"Вітаємо, {captain_name}!", "", tmpl["intro"].format(event=event_title)]
@@ -1030,10 +1056,17 @@ def send_announcement_email(team_id, ann_title, ann_body):
     if not captain_id:
         return None  # команда без капітана — надсилати нікому
 
-    captain = query_one("SELECT full_name, email FROM users WHERE id=?", (captain_id,))
+    captain = query_one("SELECT full_name, email, email_opt_in FROM users WHERE id=?", (captain_id,))
     if not captain or not captain[1]:
         return None
-    captain_name, to_email = captain
+    captain_name, to_email, opt_in = captain
+    if opt_in == 0:
+        execute("""INSERT INTO email_log (team_id,to_email,subject,body,status,created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (team_id, to_email, f"📢 {ann_title} — {event_title}",
+                 "(лист не сформовано — отримувач вимкнув email-сповіщення у профілі)",
+                 "skipped_opt_out", now()))
+        return "skipped_opt_out"
 
     subject = f"📢 {ann_title} — {event_title}"
     body_lines = [f"Вітаємо, {captain_name}!", "", ann_body or "",
@@ -1226,7 +1259,7 @@ def refresh_session_user():
     row = query_one("SELECT * FROM users WHERE id=?", (uid,))
     if row:
         cols = ["id", "username", "password", "role", "full_name", "email",
-                "university", "faculty", "created_at"]
+                "university", "faculty", "created_at", "email_opt_in"]
         st.session_state.user = dict(zip(cols, row))
 
 
@@ -1260,8 +1293,12 @@ def page_my_profile():
                 n_events = query_one("SELECT COUNT(*) FROM events")[0]
                 st.metric("Подій у системі", n_events)
 
-    tab_edit, tab_password = st.tabs(["✏️ Редагувати дані", "🔑 Змінити пароль"])
+    tab_edit, tab_password, tab_notify, tab_activity, tab_data = st.tabs(
+        ["✏️ Редагувати дані", "🔑 Змінити пароль", "🔔 Сповіщення", "🕓 Моя активність", "📤 Мої дані"])
 
+    # ================================================================
+    # ✏️ РЕДАГУВАТИ ДАНІ
+    # ================================================================
     with tab_edit:
         with st.form("edit_profile_form"):
             new_full_name = st.text_input("Повне ім'я", value=user.get("full_name") or "")
@@ -1279,6 +1316,9 @@ def page_my_profile():
                     st.success("Дані профілю оновлено.")
                     st.rerun()
 
+    # ================================================================
+    # 🔑 ЗМІНИТИ ПАРОЛЬ
+    # ================================================================
     with tab_password:
         st.caption("Пароль зберігається у вигляді хешу — його не бачить у відкритому вигляді навіть адміністратор.")
         with st.form("change_password_form"):
@@ -1298,6 +1338,201 @@ def page_my_profile():
                     execute("UPDATE users SET password=? WHERE id=?", (hash_pw(new_pw1), user["id"]))
                     refresh_session_user()
                     st.success("Пароль успішно змінено. Використовуйте його для наступного входу.")
+
+    # ================================================================
+    # 🔔 СПОВІЩЕННЯ
+    # ================================================================
+    with tab_notify:
+        st.markdown("#### Email-сповіщення")
+        current_opt_in = bool(user.get("email_opt_in", 1))
+        if user["role"] == "participant":
+            st.caption("Стосується листів про зміну статусу заявки вашої команди та email-дублікатів "
+                       "оголошень організаторів (надсилаються капітану команди).")
+        else:
+            st.caption("Наразі автоматичні email-листи платформа надсилає лише капітанам команд-учасниць. "
+                       "Якщо у вас є акаунт учасника, це налаштування стосуватиметься саме його.")
+        new_opt_in = st.toggle("Надсилати мені email-сповіщення", value=current_opt_in, key="email_opt_toggle")
+        if new_opt_in != current_opt_in:
+            execute("UPDATE users SET email_opt_in=? WHERE id=?", (int(new_opt_in), user["id"]))
+            refresh_session_user()
+            st.success("Налаштування сповіщень оновлено.")
+            st.rerun()
+
+        if user["role"] == "participant":
+            my_email_log = query_df("""SELECT el.created_at, e.title AS event, el.subject, el.status
+                                        FROM email_log el
+                                        JOIN teams t ON el.team_id = t.id
+                                        JOIN events e ON t.event_id = e.id
+                                        WHERE t.captain_id=?
+                                        ORDER BY el.created_at DESC LIMIT 20""", (user["id"],))
+            st.markdown("#### 📜 Останні листи, надіслані на вашу адресу")
+            if my_email_log.empty:
+                st.caption("Листів ще не надсилалося.")
+            else:
+                st.dataframe(my_email_log.rename(columns={"created_at": "Коли", "event": "Подія",
+                                                            "subject": "Тема", "status": "Статус"}),
+                             use_container_width=True, hide_index=True)
+
+    # ================================================================
+    # 🕓 МОЯ АКТИВНІСТЬ (рольова історія дій)
+    # ================================================================
+    with tab_activity:
+        if user["role"] == "participant":
+            st.markdown("#### 📦 Історія моїх подач проєкту")
+            my_subs = query_df("""SELECT s.updated_at, t.name AS team, e.title AS event, s.version, s.description
+                                   FROM submissions s
+                                   JOIN teams t ON s.team_id = t.id
+                                   JOIN team_members tm ON tm.team_id = t.id
+                                   JOIN events e ON t.event_id = e.id
+                                   WHERE tm.user_id=?
+                                   ORDER BY s.updated_at DESC""", (user["id"],))
+            if my_subs.empty:
+                st.caption("Подач проєктів ще не було.")
+            else:
+                st.dataframe(my_subs.rename(columns={"updated_at": "Коли", "team": "Команда",
+                                                       "event": "Подія", "version": "Версія",
+                                                       "description": "Опис"}),
+                             use_container_width=True, hide_index=True)
+
+            st.markdown("#### 🗓️ Мої консультації з менторами")
+            my_bookings = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time, u.full_name AS mentor,
+                                              e.title AS event
+                                       FROM mentor_slots ms
+                                       JOIN team_members tm ON tm.team_id = ms.team_id
+                                       JOIN users u ON ms.mentor_id = u.id
+                                       JOIN events e ON ms.event_id = e.id
+                                       WHERE tm.user_id=? AND ms.is_booked=1
+                                       ORDER BY ms.slot_date DESC""", (user["id"],))
+            if my_bookings.empty:
+                st.caption("Записів на консультації ще не було.")
+            else:
+                st.dataframe(my_bookings.rename(columns={"slot_date": "Дата", "start_time": "Початок",
+                                                           "end_time": "Кінець", "mentor": "Ментор",
+                                                           "event": "Подія"}),
+                             use_container_width=True, hide_index=True)
+
+        elif user["role"] == "jury":
+            st.markdown("#### ⭐ Останні виставлені оцінки")
+            my_scores = query_df("""SELECT s.created_at, t.id AS team_id, t.name AS team, t.faculty,
+                                            e.title AS event, e.double_blind, c.name AS criterion, s.score
+                                     FROM scores s
+                                     JOIN teams t ON s.team_id = t.id
+                                     JOIN events e ON t.event_id = e.id
+                                     JOIN criteria c ON s.criterion_id = c.id
+                                     WHERE s.jury_id=?
+                                     ORDER BY s.created_at DESC LIMIT 50""", (user["id"],))
+            if my_scores.empty:
+                st.caption("Оцінок ще не виставлено.")
+            else:
+                my_scores = my_scores.copy()
+                my_scores["Команда"] = my_scores.apply(
+                    lambda r: anon_code(r["team_id"]) if r["double_blind"] else r["team"], axis=1)
+                st.dataframe(my_scores.rename(columns={"created_at": "Коли", "event": "Подія",
+                                                         "criterion": "Критерій", "score": "Оцінка"})
+                             [["Коли", "Подія", "Команда", "Критерій", "Оцінка"]],
+                             use_container_width=True, hide_index=True)
+
+        elif user["role"] == "mentor":
+            st.markdown("#### 🗓️ Останні заброньовані консультації")
+            my_bookings_m = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time, t.name AS team,
+                                                e.title AS event
+                                         FROM mentor_slots ms
+                                         LEFT JOIN teams t ON ms.team_id = t.id
+                                         JOIN events e ON ms.event_id = e.id
+                                         WHERE ms.mentor_id=? AND ms.is_booked=1
+                                         ORDER BY ms.slot_date DESC LIMIT 50""", (user["id"],))
+            if my_bookings_m.empty:
+                st.caption("Заброньованих консультацій ще не було.")
+            else:
+                st.dataframe(my_bookings_m.rename(columns={"slot_date": "Дата", "start_time": "Початок",
+                                                             "end_time": "Кінець", "team": "Команда",
+                                                             "event": "Подія"}),
+                             use_container_width=True, hide_index=True)
+
+        elif user["role"] == "admin":
+            st.markdown("#### 🛠️ Події, створені мною")
+            my_events = query_df("SELECT title, status, created_at FROM events WHERE created_by=? ORDER BY created_at DESC",
+                                  (user["id"],))
+            if my_events.empty:
+                st.caption("Ви ще не створювали подій.")
+            else:
+                st.dataframe(my_events.rename(columns={"title": "Подія", "status": "Статус", "created_at": "Створено"}),
+                             use_container_width=True, hide_index=True)
+
+            st.markdown("#### 📢 Мої оголошення")
+            my_anns = query_df("""SELECT created_at, title, COALESCE(priority,'Звичайне') AS priority
+                                   FROM announcements WHERE created_by_name=? ORDER BY created_at DESC LIMIT 20""",
+                                (user.get("full_name"),))
+            if my_anns.empty:
+                st.caption("Ви ще не публікували оголошень.")
+            else:
+                st.dataframe(my_anns.rename(columns={"created_at": "Коли", "title": "Заголовок",
+                                                       "priority": "Пріоритет"}),
+                             use_container_width=True, hide_index=True)
+
+            st.markdown("#### 🔄 Останні зміни статусів заявок, які я вніс")
+            my_status_changes = query_df("""SELECT changed_at, old_status, new_status, comment
+                                             FROM team_status_log WHERE changed_by_id=?
+                                             ORDER BY changed_at DESC LIMIT 20""", (user["id"],))
+            if my_status_changes.empty:
+                st.caption("Ви ще не змінювали статуси заявок.")
+            else:
+                st.dataframe(my_status_changes.rename(columns={"changed_at": "Коли", "old_status": "Було",
+                                                                 "new_status": "Стало", "comment": "Коментар"}),
+                             use_container_width=True, hide_index=True)
+
+    # ================================================================
+    # 📤 МОЇ ДАНІ (персональний експорт)
+    # ================================================================
+    with tab_data:
+        st.caption("Завантажте копію ваших власних даних із платформи у форматі, зручному для збереження поза системою.")
+        if st.button("📦 Сформувати мій персональний архів (Excel)"):
+            profile_df = pd.DataFrame([{
+                "Логін": user["username"], "ПІБ": user.get("full_name"), "Роль": ROLE_LABELS.get(user["role"], user["role"]),
+                "Пошта": user.get("email"), "Факультет/спеціалізація": user.get("faculty"),
+                "У системі з": user.get("created_at"),
+            }])
+            sheets = {"Профіль": profile_df}
+
+            if user["role"] == "participant":
+                sheets["Мої_команди"] = query_df("""SELECT t.name AS team, e.title AS event, t.status
+                                                     FROM teams t JOIN team_members tm ON tm.team_id=t.id
+                                                     JOIN events e ON t.event_id=e.id WHERE tm.user_id=?""",
+                                                  (user["id"],))
+                sheets["Мої_подачі"] = query_df("""SELECT s.updated_at, t.name AS team, s.version, s.description, s.tags
+                                                    FROM submissions s JOIN team_members tm ON tm.team_id=s.team_id
+                                                    WHERE tm.user_id=?""", (user["id"],))
+                sheets["Мої_консультації"] = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time,
+                                                                 u.full_name AS mentor
+                                                          FROM mentor_slots ms
+                                                          JOIN team_members tm ON tm.team_id = ms.team_id
+                                                          JOIN users u ON ms.mentor_id = u.id
+                                                          WHERE tm.user_id=? AND ms.is_booked=1""", (user["id"],))
+            elif user["role"] == "jury":
+                sheets["Мої_призначення"] = query_df("""SELECT e.title AS event, COALESCE(n.name,'вся подія') AS nomination
+                                                         FROM jury_assignments ja JOIN events e ON ja.event_id=e.id
+                                                         LEFT JOIN nominations n ON ja.nomination_id=n.id
+                                                         WHERE ja.jury_id=?""", (user["id"],))
+                sheets["Мої_оцінки"] = query_df("""SELECT s.created_at, e.title AS event, c.name AS criterion,
+                                                           s.score, s.feedback
+                                                    FROM scores s JOIN teams t ON s.team_id=t.id
+                                                    JOIN events e ON t.event_id=e.id
+                                                    JOIN criteria c ON s.criterion_id=c.id
+                                                    WHERE s.jury_id=?""", (user["id"],))
+            elif user["role"] == "mentor":
+                sheets["Мої_слоти"] = query_df("""SELECT ms.slot_date, ms.start_time, ms.end_time, ms.location,
+                                                          e.title AS event, COALESCE(t.name,'—') AS team
+                                                   FROM mentor_slots ms JOIN events e ON ms.event_id=e.id
+                                                   LEFT JOIN teams t ON ms.team_id=t.id
+                                                   WHERE ms.mentor_id=?""", (user["id"],))
+            elif user["role"] == "admin":
+                sheets["Мої_події"] = query_df("SELECT title, status, created_at FROM events WHERE created_by=?",
+                                                (user["id"],))
+
+            data_bytes = _dfs_to_excel_bytes(sheets)
+            st.download_button("⬇️ Завантажити мій_архів_campusbridge.xlsx", data_bytes,
+                                file_name=f"my_campusbridge_data_{user['username']}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ============================================================
@@ -2119,12 +2354,15 @@ def admin_team_moderation():
         if email_results:
             sent = sum(1 for r in email_results if r == "sent")
             simulated = sum(1 for r in email_results if r == "simulated")
+            opted_out = sum(1 for r in email_results if r == "skipped_opt_out")
             failed = sum(1 for r in email_results if r.startswith("failed"))
             msg = []
             if sent:
                 msg.append(f"✅ реально надіслано: {sent}")
             if simulated:
                 msg.append(f"📧 симульовано (SMTP не налаштовано): {simulated}")
+            if opted_out:
+                msg.append(f"🔕 пропущено (отримувач вимкнув сповіщення): {opted_out}")
             if failed:
                 msg.append(f"❌ помилок надсилання: {failed}")
             st.info(" · ".join(msg))
@@ -2150,6 +2388,8 @@ def admin_team_moderation():
                 elif email_result == "simulated":
                     st.info("📧 Email-сповіщення симульовано (SMTP не налаштовано в secrets.toml) — "
                             "лист збережено в журналі нижче.")
+                elif email_result == "skipped_opt_out":
+                    st.info("🔕 Email не надіслано: капітан вимкнув email-сповіщення у своєму профілі.")
                 elif email_result and email_result.startswith("failed"):
                     st.warning(f"⚠️ Не вдалося надіслати email: {email_result}")
                 st.rerun()
@@ -3020,8 +3260,10 @@ def admin_announcements():
                         results = [r for r in results if r]
                         sent = sum(1 for r in results if r == "sent")
                         simulated = sum(1 for r in results if r == "simulated")
+                        opted_out = sum(1 for r in results if r == "skipped_opt_out")
                         failed = sum(1 for r in results if r.startswith("failed"))
-                        email_summary = f"реально надіслано: {sent} · симульовано: {simulated} · помилок: {failed}"
+                        email_summary = (f"реально надіслано: {sent} · симульовано: {simulated} · "
+                                          f"пропущено (вимкнули сповіщення): {opted_out} · помилок: {failed}")
                         execute("UPDATE announcements SET email_status=? WHERE id=?", (email_summary, new_ann_id))
 
                     st.success("Оголошення опубліковано.")
@@ -3513,8 +3755,8 @@ def participant_my_team():
                         tid = execute("""INSERT INTO teams (event_id,nomination_id,name,captain_id,invite_code,
                                          faculty,status,status_comment,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
                                       (ev_id, nom_id, team_name, user["id"], code, faculty, "На розгляді", "", now()))
-                        execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (tid, user["id"]))
-                        closed_now = maybe_autoclose_registration(ev_id)
+                        execute("INSERT INTO team_members (team_id,user_id,joined_at) VALUES (?,?,?)",
+                                (tid, user["id"], now()))
                         st.success(f"Команду створено! Інвайт-код для запрошення учасників: **{code}**")
                         if closed_now:
                             st.info("ℹ️ Це була остання вільна квота — реєстрацію на подію щойно автоматично закрито.")
@@ -3542,7 +3784,8 @@ def participant_my_team():
                         if ev and current_count >= ev[0]:
                             st.error("Команда вже заповнена (досягнуто максимальної кількості учасників).")
                         else:
-                            execute("INSERT INTO team_members (team_id,user_id) VALUES (?,?)", (tid, user["id"]))
+                            execute("INSERT INTO team_members (team_id,user_id,joined_at) VALUES (?,?,?)",
+                                    (tid, user["id"], now()))
                             st.success("Ви приєдналися до команди!")
                             st.rerun()
 
