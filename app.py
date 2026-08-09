@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+CampusBridge — платформа студентських челенджів та хакатонів
+Один файл, Python + Streamlit + SQLite.
+
+Запуск:
+    pip install streamlit pandas openpyxl
+    streamlit run campusbridge.py
+
+Дефолтний адмін: логін "admin", пароль "admin123"
+"""
+
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -894,6 +906,40 @@ def maybe_autoclose_registration(event_id):
         execute("UPDATE events SET status='Закрито' WHERE id=?", (event_id,))
         return True
     return False
+
+
+# ------------------------------------------------------------
+# Каскадне видалення: команда / подія
+# ------------------------------------------------------------
+
+def delete_team_cascade(team_id):
+    """Остаточно видаляє команду разом з усіма пов'язаними даними: учасники, подачі, файли,
+    оцінки, лайки, історія статусів, журнал email; звільняє слоти менторів і посилання оголошень."""
+    subs = query_df("SELECT id FROM submissions WHERE team_id=?", (team_id,))
+    for sid in subs["id"].tolist():
+        execute("DELETE FROM files WHERE submission_id=?", (int(sid),))
+    execute("DELETE FROM submissions WHERE team_id=?", (team_id,))
+    execute("DELETE FROM scores WHERE team_id=?", (team_id,))
+    execute("DELETE FROM team_members WHERE team_id=?", (team_id,))
+    execute("DELETE FROM showcase_likes WHERE team_id=?", (team_id,))
+    execute("DELETE FROM team_status_log WHERE team_id=?", (team_id,))
+    execute("DELETE FROM email_log WHERE team_id=?", (team_id,))
+    execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE team_id=?", (team_id,))
+    execute("UPDATE announcements SET target_team_id=NULL WHERE target_team_id=?", (team_id,))
+    execute("DELETE FROM teams WHERE id=?", (team_id,))
+
+
+def delete_event_cascade(event_id):
+    """Остаточно видаляє подію разом з усіма її командами (каскадно) та іншими пов'язаними даними."""
+    team_ids = query_df("SELECT id FROM teams WHERE event_id=?", (event_id,))["id"].tolist()
+    for tid in team_ids:
+        delete_team_cascade(int(tid))
+    execute("DELETE FROM criteria WHERE event_id=?", (event_id,))
+    execute("DELETE FROM nominations WHERE event_id=?", (event_id,))
+    execute("DELETE FROM jury_assignments WHERE event_id=?", (event_id,))
+    execute("DELETE FROM mentor_slots WHERE event_id=?", (event_id,))
+    execute("DELETE FROM announcements WHERE event_id=?", (event_id,))
+    execute("DELETE FROM events WHERE id=?", (event_id,))
 
 
 # ------------------------------------------------------------
@@ -2264,17 +2310,85 @@ def admin_event_builder():
         st.markdown("---")
         st.markdown("#### Номінації")
         noms = query_df("SELECT * FROM nominations WHERE event_id=?", (editing_id,))
-        st.dataframe(noms[["id", "name"]] if not noms.empty else noms, use_container_width=True, hide_index=True)
+        if noms.empty:
+            st.caption("Номінацій ще немає.")
+        else:
+            for _, nom in noms.iterrows():
+                nc1, nc2, nc3 = st.columns([4, 1, 1])
+                with nc1:
+                    new_nom_name = st.text_input("Назва номінації", value=nom["name"],
+                                                  key=f"nom_name_{nom['id']}", label_visibility="collapsed")
+                with nc2:
+                    if st.button("💾", key=f"nom_save_{nom['id']}", help="Зберегти нову назву"):
+                        execute("UPDATE nominations SET name=? WHERE id=?", (new_nom_name, int(nom["id"])))
+                        st.rerun()
+                with nc3:
+                    if st.button("🗑️", key=f"nom_del_{nom['id']}", help="Видалити номінацію"):
+                        n_teams_nom = query_one("SELECT COUNT(*) FROM teams WHERE nomination_id=?",
+                                                 (int(nom["id"]),))[0]
+                        if n_teams_nom:
+                            st.warning(f"У номінації «{nom['name']}» є {n_teams_nom} команд(и) — спочатку "
+                                       "перенесіть їх в іншу номінацію (у розділі «Модерація заявок») "
+                                       "або видаліть ці команди.")
+                        else:
+                            execute("DELETE FROM nominations WHERE id=?", (int(nom["id"]),))
+                            st.rerun()
         with st.form("nom_form"):
             nom_name = st.text_input("Нова номінація (наприклад, AI-трек, Бізнес-трек)")
-            if st.form_submit_button("Додати номінацію") and nom_name:
+            if st.form_submit_button("➕ Додати номінацію") and nom_name:
                 execute("INSERT INTO nominations (event_id, name) VALUES (?,?)", (editing_id, nom_name))
                 st.rerun()
 
         st.markdown("#### Критерії оцінювання")
         crit = query_df("SELECT * FROM criteria WHERE event_id=?", (editing_id,))
-        st.dataframe(crit[["id", "name", "weight", "max_score"]] if not crit.empty else crit,
-                     use_container_width=True, hide_index=True)
+        if crit.empty:
+            st.caption("Критеріїв ще немає.")
+        else:
+            for _, cr in crit.iterrows():
+                cr1, cr2, cr3, cr4 = st.columns([3, 1, 1, 1])
+                with cr1:
+                    new_cname = st.text_input("Назва", value=cr["name"], key=f"crit_name_{cr['id']}",
+                                               label_visibility="collapsed")
+                with cr2:
+                    new_cweight = st.number_input("Вага %", min_value=1, max_value=100, value=int(cr["weight"]),
+                                                   key=f"crit_w_{cr['id']}", label_visibility="collapsed")
+                with cr3:
+                    new_cmax = st.number_input("Макс.", min_value=1, max_value=100, value=int(cr["max_score"]),
+                                                key=f"crit_m_{cr['id']}", label_visibility="collapsed")
+                with cr4:
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        if st.button("💾", key=f"crit_save_{cr['id']}", help="Зберегти зміни"):
+                            execute("UPDATE criteria SET name=?, weight=?, max_score=? WHERE id=?",
+                                    (new_cname, new_cweight, new_cmax, int(cr["id"])))
+                            st.rerun()
+                    with bc2:
+                        n_scores_crit = query_one("SELECT COUNT(*) FROM scores WHERE criterion_id=?",
+                                                   (int(cr["id"]),))[0]
+                        if st.button("🗑️", key=f"crit_del_{cr['id']}",
+                                     help="Видалити критерій" + (f" (разом із {n_scores_crit} оцінками)"
+                                                                  if n_scores_crit else "")):
+                            st.session_state[f"confirm_crit_del_{cr['id']}"] = True
+                if st.session_state.get(f"confirm_crit_del_{cr['id']}"):
+                    n_scores_crit = query_one("SELECT COUNT(*) FROM scores WHERE criterion_id=?",
+                                               (int(cr["id"]),))[0]
+                    with st.container(border=True):
+                        if n_scores_crit:
+                            st.warning(f"⚠️ За критерієм «{cr['name']}» вже є {n_scores_crit} виставлених оцінок. "
+                                       "Видалення критерію безповоротно видалить і їх.")
+                        else:
+                            st.warning(f"Видалити критерій «{cr['name']}»?")
+                        bcc1, bcc2 = st.columns(2)
+                        with bcc1:
+                            if st.button("Так, видалити остаточно", key=f"crit_del_confirm_{cr['id']}"):
+                                execute("DELETE FROM scores WHERE criterion_id=?", (int(cr["id"]),))
+                                execute("DELETE FROM criteria WHERE id=?", (int(cr["id"]),))
+                                st.session_state.pop(f"confirm_crit_del_{cr['id']}", None)
+                                st.rerun()
+                        with bcc2:
+                            if st.button("Скасувати", key=f"crit_del_cancel_{cr['id']}"):
+                                st.session_state.pop(f"confirm_crit_del_{cr['id']}", None)
+                                st.rerun()
         with st.form("crit_form"):
             cc1, cc2, cc3 = st.columns(3)
             with cc1:
@@ -2283,10 +2397,28 @@ def admin_event_builder():
                 cweight = st.number_input("Вага, %", min_value=1, max_value=100, value=25)
             with cc3:
                 cmax = st.number_input("Макс. бал", min_value=1, max_value=100, value=10)
-            if st.form_submit_button("Додати критерій") and cname:
+            if st.form_submit_button("➕ Додати критерій") and cname:
                 execute("INSERT INTO criteria (event_id,name,weight,max_score) VALUES (?,?,?,?)",
                         (editing_id, cname, cweight, cmax))
                 st.rerun()
+
+        st.markdown("---")
+        with st.expander("⚠️ Небезпечна зона: видалити подію остаточно"):
+            st.error("Ця дія назавжди видалить подію разом з усіма її командами, учасниками, поданими "
+                     "проєктами, файлами презентацій, оцінками журі, критеріями, номінаціями, "
+                     "призначеннями журі, слотами консультацій та оголошеннями цієї події. "
+                     "Скасувати цю дію неможливо.")
+            confirm_ev_name = st.text_input("Для підтвердження введіть точну назву події",
+                                             key=f"del_ev_confirm_{editing_id}")
+            if st.button("🗑️ Видалити подію остаточно", key=f"del_ev_btn_{editing_id}", type="primary"):
+                if confirm_ev_name.strip() == (ev.get("title") or "").strip():
+                    delete_event_cascade(editing_id)
+                    st.session_state.pop("_event_template", None)
+                    st.session_state.pop("_event_template_name", None)
+                    st.success("Подію остаточно видалено.")
+                    st.rerun()
+                else:
+                    st.error("Введена назва не збігається з назвою події — видалення скасовано.")
 
 
 def admin_team_moderation():
@@ -2392,6 +2524,15 @@ def admin_team_moderation():
                                              "new_status": "Стало", "changed_by_name": "Хто змінив",
                                              "comment": "Коментар"}),
                     use_container_width=True, hide_index=True)
+
+            with st.expander("🗑️ Видалити цю заявку команди остаточно"):
+                st.warning("Це остаточно видалить команду, її учасників, подані проєкти й файли презентацій, "
+                           "оцінки журі та історію статусів. На відміну від зміни статусу на «Відхилено», "
+                           "цю дію неможливо скасувати. Використовуйте для дублікатів або явного спаму.")
+                if st.button("Так, видалити команду остаточно", key=f"hard_del_team_{t['id']}"):
+                    delete_team_cascade(int(t["id"]))
+                    st.success(f"Команду «{t['name']}» остаточно видалено.")
+                    st.rerun()
 
     st.markdown("#### 📧 Журнал email-сповіщень")
     smtp_cfg = get_smtp_config()
@@ -3791,10 +3932,53 @@ def participant_my_team():
                     st.caption(f"Коментар журі/адміністратора: {t['status_comment']}")
                 st.write(f"Інвайт-код для запрошення: `{t['invite_code']}`")
 
-                members = query_df("""SELECT u.full_name, u.email FROM team_members tm
-                                       JOIN users u ON tm.user_id=u.id WHERE tm.team_id=?""", (t["id"],))
+                members_full = query_df("""SELECT tm.id AS membership_id, u.id AS user_id, u.full_name, u.email
+                                            FROM team_members tm JOIN users u ON tm.user_id=u.id
+                                            WHERE tm.team_id=? ORDER BY tm.id""", (t["id"],))
+                is_captain = (t["captain_id"] == user["id"])
                 st.write("**Учасники команди:**")
-                st.dataframe(members, use_container_width=True, hide_index=True)
+                for _, m in members_full.iterrows():
+                    mc1, mc2 = st.columns([4, 1])
+                    with mc1:
+                        captain_tag = " 👑 капітан" if m["user_id"] == t["captain_id"] else ""
+                        st.write(f"{m['full_name']}{captain_tag} · {m['email']}")
+                    with mc2:
+                        if is_captain and m["user_id"] != user["id"]:
+                            if st.button("🗑️ Прибрати", key=f"kick_{t['id']}_{m['membership_id']}"):
+                                execute("DELETE FROM team_members WHERE id=?", (int(m["membership_id"]),))
+                                st.success(f"{m['full_name']} видалено з команди.")
+                                st.rerun()
+                        elif not is_captain and m["user_id"] == user["id"]:
+                            if st.button("🚪 Покинути", key=f"leave_{t['id']}_{m['membership_id']}"):
+                                execute("DELETE FROM team_members WHERE id=?", (int(m["membership_id"]),))
+                                st.success("Ви покинули команду.")
+                                st.rerun()
+
+                if is_captain:
+                    with st.expander("✏️ Редагувати назву команди / факультет"):
+                        with st.form(f"edit_team_form_{t['id']}"):
+                            new_team_name = st.text_input("Назва команди", value=t["name"])
+                            new_team_faculty = st.text_input("Факультет", value=t["faculty"] or "")
+                            if st.form_submit_button("💾 Зберегти"):
+                                if not new_team_name.strip():
+                                    st.error("Назва команди не може бути порожньою.")
+                                else:
+                                    execute("UPDATE teams SET name=?, faculty=? WHERE id=?",
+                                            (new_team_name.strip(), new_team_faculty.strip(), int(t["id"])))
+                                    st.success("Дані команди оновлено.")
+                                    st.rerun()
+
+                    if t["status"] in ("На розгляді", "Потребує доопрацювання"):
+                        with st.expander("🗑️ Відкликати заявку команди"):
+                            st.warning("Це остаточно видалить команду, учасників і подані дані. Дію неможливо "
+                                       "скасувати. Доступно лише поки заявку ще не прийнято організаторами.")
+                            if st.button("Так, відкликати та видалити команду", key=f"withdraw_{t['id']}"):
+                                delete_team_cascade(int(t["id"]))
+                                st.success("Заявку відкликано, команду видалено.")
+                                st.rerun()
+                    else:
+                        st.caption("ℹ️ Заявку вже прийнято організаторами — для видалення команди зверніться "
+                                   "до адміністратора платформи.")
 
                 st.markdown("#### 📦 Подача проєкту")
                 last_sub = query_one("""SELECT repo_link, presentation_link, video_link, description, version, tags
@@ -3981,6 +4165,15 @@ def jury_evaluation():
     if jury_see_other_scores:
         st.caption("👀 Для цієї події увімкнено прозорий режим — ви бачите оцінки й фідбек колег по журі.")
 
+    with st.expander("🚪 Відмовитися від оцінювання цієї події"):
+        st.caption("Ваше призначення на цю подію буде знято, і нові команди для оцінювання вам більше "
+                   "не показуватимуться. Оцінки, які ви вже встигли виставити, залишаться в системі "
+                   "для організаторів — щоб їх теж прибрати, спочатку скиньте їх нижче біля кожної команди.")
+        if st.button("Так, відмовитися від оцінювання цієї події", key=f"jury_unassign_{ev_id}"):
+            execute("DELETE FROM jury_assignments WHERE event_id=? AND jury_id=?", (ev_id, user["id"]))
+            st.success("Призначення на цю подію знято.")
+            st.rerun()
+
     if any(pd.isna(n) for n in nom_ids):
         teams = query_df("SELECT * FROM teams WHERE event_id=? AND status='Прийнято'", (ev_id,))
     else:
@@ -4127,6 +4320,12 @@ def jury_evaluation():
                                    DO UPDATE SET score=excluded.score, feedback=excluded.feedback, created_at=excluded.created_at""",
                                 (t["id"], user["id"], crit_id, val, feedback, now()))
                     st.success("Оцінку збережено.")
+                    st.rerun()
+
+            if ti["scored"]:
+                if st.button("🗑️ Скинути мою оцінку для цієї команди", key=f"reset_score_{t['id']}"):
+                    execute("DELETE FROM scores WHERE team_id=? AND jury_id=?", (t["id"], user["id"]))
+                    st.success("Вашу оцінку для цієї команди скинуто — можете оцінити її ще раз.")
                     st.rerun()
 
     # ------------------------------------------------------------
@@ -4379,6 +4578,25 @@ def mentor_slots_manager():
                     contact_str = f" · 📧 {contact[1]}" if contact and contact[1] else ""
                     st.info(f"**{s['slot_date']} {s['start_time']}–{s['end_time']}** · команда «{s['team']}»"
                             f"{contact_str} · {s['location'] or 'онлайн'}")
+
+            st.markdown("#### 🧹 Масове видалення вільних слотів")
+            st.caption("Швидко прибрати всі ще не заброньовані слоти на конкретну дату (наприклад, "
+                       "якщо плани змінилися й ви не зможете провести консультації того дня).")
+            bd_col1, bd_col2 = st.columns([2, 1])
+            with bd_col1:
+                bulk_del_date = st.text_input("Дата (ГГГГ-ММ-ДД)", key="bulk_del_date")
+            with bd_col2:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Видалити вільні слоти цієї дати") and bulk_del_date:
+                    n_del = query_one("""SELECT COUNT(*) FROM mentor_slots
+                                          WHERE mentor_id=? AND event_id=? AND slot_date=? AND is_booked=0""",
+                                       (user["id"], ev_id, bulk_del_date))[0]
+                    execute("""DELETE FROM mentor_slots
+                               WHERE mentor_id=? AND event_id=? AND slot_date=? AND is_booked=0""",
+                            (user["id"], ev_id, bulk_del_date))
+                    st.success(f"Видалено {n_del} вільних слотів на {bulk_del_date}.")
+                    st.rerun()
 
             st.markdown("#### Фільтри розкладу")
             f1, f2 = st.columns(2)
