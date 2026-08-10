@@ -1375,6 +1375,12 @@ def refresh_session_user():
         st.session_state.user = dict(zip(cols, row))
 
 
+def _go_to(menu_key, label):
+    """Програмно перемикає бічне меню ролі на потрібний розділ (для кнопок швидких дій на дашборді)."""
+    st.session_state[menu_key] = label
+    st.rerun()
+
+
 ROLE_LABELS = {"admin": "Адміністратор", "participant": "Учасник", "jury": "Журі", "mentor": "Ментор"}
 
 
@@ -3908,6 +3914,28 @@ def page_admin_dashboard():
     k3.metric("⏳ Очікують розгляду", pending_teams)
     k4.metric("Учасників", total_members)
 
+    st.markdown("#### ⚡ Швидкі дії")
+    nb1, nb2, nb3, nb4, nb5 = st.columns(5)
+    with nb1:
+        if st.button("📥 Модерація заявок", use_container_width=True):
+            st.session_state["admin_menu"] = "📥 Модерація заявок"
+            st.rerun()
+    with nb2:
+        if st.button("🛠️ Конструктор подій", use_container_width=True):
+            st.session_state["admin_menu"] = "🛠️ Конструктор подій"
+            st.rerun()
+    with nb3:
+        if st.button("📊 Аналітика", use_container_width=True):
+            st.session_state["admin_menu"] = "📊 Аналітика та звіти"
+            st.rerun()
+    with nb4:
+        if st.button("📢 Сповіщення", use_container_width=True):
+            st.session_state["admin_menu"] = "📢 Сповіщення"
+            st.rerun()
+    with nb5:
+        if st.button("🔄 Оновити дашборд", use_container_width=True):
+            st.rerun()
+
     st.markdown("---")
     st.markdown("#### 🔔 Потребує уваги")
     attention_items = []
@@ -4054,6 +4082,32 @@ def page_admin_dashboard():
             for _, r in recent_subs.iterrows():
                 st.caption(f"{r['updated_at'][:16]} · «{r['team']}»")
 
+    st.markdown("---")
+    st.markdown("#### ⚡ Дія одним кліком")
+    no_sub_teams = query_df("""SELECT t.id, t.name FROM teams t
+                                WHERE t.status='Прийнято'
+                                AND t.id NOT IN (SELECT DISTINCT team_id FROM submissions)""")
+    if no_sub_teams.empty:
+        st.caption("✅ Усі прийняті команди вже подали проєкт — нагадування не потрібне.")
+    else:
+        st.caption(f"⚠️ {len(no_sub_teams)} прийнятих команд ще не подали проєкт.")
+        if st.button(f"📧 Надіслати нагадування {len(no_sub_teams)} командам без поданого проєкту"):
+            results = []
+            for _, tt in no_sub_teams.iterrows():
+                r = send_announcement_email(
+                    int(tt["id"]), "Нагадування: подайте проєкт",
+                    "Ми ще не отримали подачу проєкту від вашої команди. Будь ласка, завантажте опис, "
+                    "посилання на репозиторій і презентацію в особистому кабінеті («🚀 Моя команда») "
+                    "якнайшвидше — це важливо для участі в оцінюванні.")
+                if r:
+                    results.append(r)
+            sent = sum(1 for r in results if r == "sent")
+            simulated = sum(1 for r in results if r == "simulated")
+            opted_out = sum(1 for r in results if r == "skipped_opt_out")
+            failed = sum(1 for r in results if r.startswith("failed"))
+            st.success(f"Готово — реально надіслано: {sent} · симульовано: {simulated} · "
+                       f"пропущено (вимкнули сповіщення): {opted_out} · помилок: {failed}")
+
 
 def page_admin():
     st.sidebar.markdown("### 👑 Меню адміністратора")
@@ -4061,7 +4115,7 @@ def page_admin():
         "🏠 Дашборд", "🛠️ Конструктор подій", "📥 Модерація заявок", "⚖️ Журі", "🧑‍🏫 Ментори",
         "📊 Аналітика та звіти", "📢 Сповіщення", "📤 Імпорт/Експорт", "🏆 Лідерборд",
         "🖼️ Портфоліо проєктів", "👤 Мій профіль"
-    ])
+    ], key="admin_menu")
     if menu == "🏠 Дашборд":
         page_admin_dashboard()
     elif menu == "🛠️ Конструктор подій":
@@ -4393,6 +4447,25 @@ def page_participant_dashboard():
     user = st.session_state.user
     st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
 
+    st.markdown("#### ⚡ Швидкі дії")
+    nb1, nb2, nb3, nb4 = st.columns(4)
+    with nb1:
+        if st.button("🚀 Моя команда", use_container_width=True):
+            st.session_state["participant_menu"] = "🚀 Моя команда"
+            st.rerun()
+    with nb2:
+        if st.button("🗓️ Office Hours", use_container_width=True):
+            st.session_state["participant_menu"] = "🗓️ Office Hours"
+            st.rerun()
+    with nb3:
+        if st.button("📅 Календар подій", use_container_width=True):
+            st.session_state["participant_menu"] = "📅 Календар подій"
+            st.rerun()
+    with nb4:
+        if st.button("🖼️ Портфоліо", use_container_width=True):
+            st.session_state["participant_menu"] = "🖼️ Портфоліо проєктів"
+            st.rerun()
+
     my_teams = query_df("""SELECT t.*, e.title AS event_title, e.pitch_deadline, e.event_start,
                                    e.min_team, e.max_team, e.leaderboard_live
                             FROM teams t JOIN team_members tm ON t.id=tm.team_id
@@ -4479,7 +4552,8 @@ def page_participant_dashboard():
 def page_participant():
     st.sidebar.markdown("### 🎓 Меню учасника")
     menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
-                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"])
+                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"],
+                             key="participant_menu")
     if menu == "🏠 Дашборд":
         page_participant_dashboard()
     elif menu == "📅 Календар подій":
@@ -4533,6 +4607,21 @@ def page_announcements_view():
 def page_jury_dashboard():
     user = st.session_state.user
     st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
+
+    st.markdown("#### ⚡ Швидкі дії")
+    nb1, nb2, nb3 = st.columns(3)
+    with nb1:
+        if st.button("📋 Перейти до оцінювання", use_container_width=True):
+            st.session_state["jury_menu"] = "📋 Оцінювання"
+            st.rerun()
+    with nb2:
+        if st.button("🏆 Лідерборд", use_container_width=True):
+            st.session_state["jury_menu"] = "🏆 Лідерборд"
+            st.rerun()
+    with nb3:
+        if st.button("📢 Оголошення", use_container_width=True):
+            st.session_state["jury_menu"] = "📢 Оголошення"
+            st.rerun()
 
     assignments = query_df("""SELECT DISTINCT ja.event_id, e.title AS event_title, e.double_blind, e.pitch_deadline
                                FROM jury_assignments ja JOIN events e ON ja.event_id=e.id
@@ -4636,7 +4725,7 @@ def page_jury_dashboard():
 def page_jury():
     st.sidebar.markdown("### ⚖️ Меню журі")
     menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "📋 Оцінювання", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
-                                        "📢 Оголошення", "👤 Профіль"])
+                                        "📢 Оголошення", "👤 Профіль"], key="jury_menu")
     if menu == "🏠 Дашборд":
         page_jury_dashboard()
     elif menu == "📋 Оцінювання":
@@ -4944,11 +5033,38 @@ def page_mentor_dashboard():
     user = st.session_state.user
     st.subheader(f"🏠 Вітаємо, {user['full_name'].split(' ')[0]}!")
 
+    st.markdown("#### ⚡ Швидкі дії")
+    nb1, nb2, nb3 = st.columns(3)
+    with nb1:
+        if st.button("🗓️ Мої слоти консультацій", use_container_width=True):
+            st.session_state["mentor_menu"] = "🗓️ Мої слоти консультацій"
+            st.rerun()
+    with nb2:
+        if st.button("📢 Оголошення", use_container_width=True):
+            st.session_state["mentor_menu"] = "📢 Оголошення"
+            st.rerun()
+    with nb3:
+        quick_events = get_events()
+        if not quick_events.empty and st.button("➕ Додати слот на сьогодні 15:00–15:15", use_container_width=True):
+            quick_ev_id = int(quick_events.iloc[0]["id"])
+            dup = query_one("""SELECT id FROM mentor_slots WHERE mentor_id=? AND event_id=?
+                                AND slot_date=? AND start_time=?""",
+                             (user["id"], quick_ev_id, str(datetime.date.today()), "15:00"))
+            if dup:
+                st.warning("Такий слот уже існує на сьогодні.")
+            else:
+                execute("""INSERT INTO mentor_slots (mentor_id,event_id,slot_date,start_time,end_time,
+                           location,is_booked,team_id,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (user["id"], quick_ev_id, str(datetime.date.today()), "15:00", "15:15",
+                         "Онлайн", 0, None, "", now()))
+                st.success(f"Слот 15:00–15:15 на сьогодні додано для події «{quick_events.iloc[0]['title']}».")
+                st.rerun()
+
     all_slots = query_df("""SELECT ms.*, e.title AS event_title FROM mentor_slots ms
                              JOIN events e ON ms.event_id=e.id WHERE ms.mentor_id=?""", (user["id"],))
     if all_slots.empty:
         st.info("У вас ще немає жодного слоту консультацій. Перейдіть у «🗓️ Мої слоти консультацій», "
-                "щоб додати їх.")
+                "щоб додати їх, або скористайтесь кнопкою вище.")
         return
 
     total = len(all_slots)
@@ -5027,7 +5143,7 @@ def page_mentor_dashboard():
 def page_mentor():
     st.sidebar.markdown("### 🧑‍🏫 Меню ментора")
     menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "🗓️ Мої слоти консультацій", "🏆 Лідерборд",
-                                        "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"])
+                                        "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"], key="mentor_menu")
     if menu == "🏠 Дашборд":
         page_mentor_dashboard()
     elif menu == "🗓️ Мої слоти консультацій":
