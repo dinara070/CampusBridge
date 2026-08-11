@@ -254,6 +254,11 @@ def init_db():
         team_id INTEGER, to_email TEXT, subject TEXT, body TEXT,
         status TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS team_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, question TEXT, asked_by_id INTEGER, asked_by_name TEXT, asked_at TEXT,
+        answer TEXT, answered_by_name TEXT, answered_at TEXT
+    )""")
     conn.commit()
 
     # м'які міграції: додаємо нові колонки, якщо їх ще немає
@@ -883,6 +888,127 @@ def generate_jury_protocol_pdf(event_id):
     return buf.getvalue()
 
 
+def compute_team_rank(team_id):
+    """Повертає (місце, всього_команд) команди в її номінації/події за зваженим балом, або None якщо оцінок немає."""
+    team = query_one("SELECT event_id, nomination_id FROM teams WHERE id=?", (team_id,))
+    if not team:
+        return None
+    event_id, nomination_id = team
+    if nomination_id is not None:
+        teams_scope = query_df("SELECT id FROM teams WHERE event_id=? AND nomination_id=? AND status='Прийнято'",
+                                (event_id, nomination_id))
+    else:
+        teams_scope = query_df("SELECT id FROM teams WHERE event_id=? AND status='Прийнято'", (event_id,))
+    ranked = []
+    for _, t in teams_scope.iterrows():
+        score = compute_team_score(int(t["id"]))
+        if score is not None:
+            ranked.append((int(t["id"]), score))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    for i, (tid, _) in enumerate(ranked, start=1):
+        if tid == team_id:
+            return i, len(ranked)
+    return None
+
+
+def generate_team_certificate_pdf(team_id):
+    """Формує PDF-сертифікат участі (або перемоги, якщо команда в топ-3) для команди."""
+    if not PDF_LIB_AVAILABLE:
+        return None
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+
+    team_row = query_one("""SELECT t.name, t.faculty, e.title, e.university, e.faculty, e.event_start
+                             FROM teams t JOIN events e ON t.event_id=e.id WHERE t.id=?""", (team_id,))
+    if not team_row:
+        return None
+    team_name, team_faculty, event_title, university, org_faculty, event_start = team_row
+
+    members = query_df("""SELECT u.full_name FROM team_members tm JOIN users u ON tm.user_id=u.id
+                           WHERE tm.team_id=?""", (team_id,))
+    member_names = members["full_name"].tolist() if not members.empty else []
+
+    rank_info = compute_team_rank(team_id)
+    medal_labels = {1: "1 місце", 2: "2 місце", 3: "3 місце"}
+    is_winner = rank_info is not None and rank_info[0] in (1, 2, 3)
+
+    font_regular, font_bold = _register_pdf_fonts()
+    use_translit = font_regular is None
+    font_regular = font_regular or "Helvetica"
+    font_bold = font_bold or "Helvetica-Bold"
+
+    def T(text):
+        return transliterate_ua(text) if use_translit else (text or "")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=2 * cm, bottomMargin=2 * cm,
+                             leftMargin=2.5 * cm, rightMargin=2.5 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("CertTitle", parent=styles["Title"], fontName=font_bold,
+                                  alignment=TA_CENTER, fontSize=30, textColor=colors.HexColor("#4F8BF9"))
+    subtitle_style = ParagraphStyle("CertSubtitle", parent=styles["Normal"], fontName=font_regular,
+                                     alignment=TA_CENTER, fontSize=12, spaceAfter=6)
+    team_style = ParagraphStyle("CertTeam", parent=styles["Title"], fontName=font_bold,
+                                 alignment=TA_CENTER, fontSize=22, spaceAfter=10)
+    body_style = ParagraphStyle("CertBody", parent=styles["Normal"], fontName=font_regular,
+                                 alignment=TA_CENTER, fontSize=13, spaceAfter=6)
+    small_style = ParagraphStyle("CertSmall", parent=styles["Normal"], fontName=font_regular,
+                                  alignment=TA_CENTER, fontSize=10, textColor=colors.grey)
+
+    divider = Table([[""]], colWidths=[300], rowHeights=[3])
+    divider.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#4F8BF9"))]))
+    divider.hAlign = "CENTER"
+
+    elements = [
+        Spacer(1, 10),
+        Paragraph(T(university), subtitle_style),
+        Paragraph(T(org_faculty), subtitle_style),
+        Spacer(1, 20),
+        Paragraph(T("СЕРТИФІКАТ ПЕРЕМОЖЦЯ" if is_winner else "СЕРТИФІКАТ УЧАСНИКА"), title_style),
+        Spacer(1, 8),
+        divider,
+        Spacer(1, 20),
+        Paragraph(T("Видано команді"), body_style),
+        Paragraph(T(team_name), team_style),
+    ]
+    if is_winner:
+        medal_colors = {1: "#FFD700", 2: "#C0C0C0", 3: "#CD7F32"}
+        medal_style = ParagraphStyle("CertMedal", parent=body_style, fontName=font_bold,
+                                      textColor=colors.HexColor(medal_colors[rank_info[0]]), fontSize=15)
+        elements.append(Paragraph(T(f"{medal_labels[rank_info[0]]} із {rank_info[1]} команд"), medal_style))
+        elements.append(Spacer(1, 8))
+    elements += [
+        Paragraph(T(f"за участь у події «{event_title}»"), body_style),
+        Spacer(1, 4),
+        Paragraph(T(f"Факультет: {team_faculty or '—'}"), body_style),
+    ]
+    if member_names:
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(T("Склад команди: " + ", ".join(member_names)), body_style))
+
+    elements.append(Spacer(1, 30))
+    sign_table = Table([[T("____________________________"), T("____________________________")],
+                         [T("Голова організаційного комітету"), T(f"Дата: {event_start or now()[:10]}")]],
+                        colWidths=[280, 280])
+    sign_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font_regular),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]))
+    elements.append(sign_table)
+    elements.append(Spacer(1, 16))
+    elements.append(Paragraph(T("CampusBridge — платформа студентських челенджів та хакатонів"), small_style))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 def anon_code(team_id):
     """Детермінований анонімний код команди для сліпого оцінювання."""
     h = hashlib.md5(f"team-anon-{team_id}".encode("utf-8")).hexdigest()[:5].upper()
@@ -920,7 +1046,8 @@ def maybe_autoclose_registration(event_id):
 
 def delete_team_cascade(team_id):
     """Остаточно видаляє команду разом з усіма пов'язаними даними: учасники, подачі, файли,
-    оцінки, лайки, історія статусів, журнал email; звільняє слоти менторів і посилання оголошень."""
+    оцінки, лайки, історія статусів, журнал email, питання до організаторів; звільняє слоти
+    менторів і посилання оголошень."""
     subs = query_df("SELECT id FROM submissions WHERE team_id=?", (team_id,))
     for sid in subs["id"].tolist():
         execute("DELETE FROM files WHERE submission_id=?", (int(sid),))
@@ -930,6 +1057,7 @@ def delete_team_cascade(team_id):
     execute("DELETE FROM showcase_likes WHERE team_id=?", (team_id,))
     execute("DELETE FROM team_status_log WHERE team_id=?", (team_id,))
     execute("DELETE FROM email_log WHERE team_id=?", (team_id,))
+    execute("DELETE FROM team_questions WHERE team_id=?", (team_id,))
     execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE team_id=?", (team_id,))
     execute("UPDATE announcements SET target_team_id=NULL WHERE target_team_id=?", (team_id,))
     execute("DELETE FROM teams WHERE id=?", (team_id,))
@@ -1221,6 +1349,42 @@ def get_email_log_for_event(event_id):
 
 
 # ------------------------------------------------------------
+# Питання команд до організаторів (двосторонній зв'язок)
+# ------------------------------------------------------------
+
+def ask_team_question(team_id, question_text):
+    user = st.session_state.get("user") or {}
+    execute("""INSERT INTO team_questions (team_id,question,asked_by_id,asked_by_name,asked_at,
+               answer,answered_by_name,answered_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (team_id, question_text, user.get("id"), user.get("full_name", "Учасник"), now(),
+             None, None, None))
+
+
+def answer_team_question(question_id, answer_text):
+    user = st.session_state.get("user") or {}
+    execute("UPDATE team_questions SET answer=?, answered_by_name=?, answered_at=? WHERE id=?",
+            (answer_text, user.get("full_name", "Адміністратор"), now(), question_id))
+
+
+def get_team_questions(team_id):
+    return query_df("SELECT * FROM team_questions WHERE team_id=? ORDER BY asked_at DESC", (team_id,))
+
+
+def get_unanswered_questions_count():
+    return query_one("SELECT COUNT(*) FROM team_questions WHERE answer IS NULL")[0]
+
+
+# ------------------------------------------------------------
+# QR-код для швидкого приєднання до команди офлайн (наприклад, на реєстрації хакатону)
+# ------------------------------------------------------------
+
+def qr_code_url(data, size=180):
+    """Публічний сервіс генерації QR-коду за URL-параметром — без потреби у сторонніх бібліотеках."""
+    import urllib.parse
+    return f"https://api.qrserver.com/v1/create-qr-code/?size={size}x{size}&data={urllib.parse.quote(data)}"
+
+
+# ------------------------------------------------------------
 # Лайки глядачів (Community Choice Award) для портфоліо
 # ------------------------------------------------------------
 
@@ -1373,12 +1537,6 @@ def refresh_session_user():
         cols = ["id", "username", "password", "role", "full_name", "email",
                 "university", "faculty", "created_at", "email_opt_in"]
         st.session_state.user = dict(zip(cols, row))
-
-
-def _go_to(menu_key, label):
-    """Програмно перемикає бічне меню ролі на потрібний розділ (для кнопок швидких дій на дашборді)."""
-    st.session_state[menu_key] = label
-    st.rerun()
 
 
 ROLE_LABELS = {"admin": "Адміністратор", "participant": "Учасник", "jury": "Журі", "mentor": "Ментор"}
@@ -2016,7 +2174,8 @@ def page_leaderboard():
     for i, (t, score) in enumerate(ranked):
         place_label = f"{medals[i]} " if i < 3 and score is not None else ""
         with st.expander(f"{place_label}{t['name']} ({t['faculty']}) — {score if score is not None else '—'} балів"):
-            tab_portfolio, tab_breakdown = st.tabs(["📦 Портфоліо проєкту", "🔍 Деталізація балу"])
+            tab_portfolio, tab_breakdown, tab_cert = st.tabs(
+                ["📦 Портфоліо проєкту", "🔍 Деталізація балу", "🎓 Сертифікат"])
             with tab_portfolio:
                 sub = query_one("""SELECT repo_link, presentation_link, video_link, description
                                     FROM submissions WHERE team_id=? ORDER BY version DESC LIMIT 1""", (t["id"],))
@@ -2030,6 +2189,18 @@ def page_leaderboard():
                     st.write("Подача ще не завантажена.")
             with tab_breakdown:
                 render_score_breakdown(t["id"])
+            with tab_cert:
+                if not PDF_LIB_AVAILABLE:
+                    st.caption("Для генерації сертифіката на сервері потрібен пакет `reportlab`.")
+                else:
+                    cert_bytes = generate_team_certificate_pdf(int(t["id"]))
+                    if cert_bytes:
+                        st.download_button(
+                            "🎓 Завантажити сертифікат (PDF)", data=cert_bytes,
+                            file_name=f"certificate_{t['name'][:30].replace(' ', '_')}.pdf",
+                            mime="application/pdf", key=f"cert_dl_{t['id']}")
+                    else:
+                        st.caption("Не вдалося сформувати сертифікат для цієї команди.")
 
 
 # ============================================================
@@ -2637,6 +2808,29 @@ def admin_team_moderation():
                                              "new_status": "Стало", "changed_by_name": "Хто змінив",
                                              "comment": "Коментар"}),
                     use_container_width=True, hide_index=True)
+
+            st.markdown("**💬 Питання від команди**")
+            questions_df = get_team_questions(int(t["id"]))
+            if questions_df.empty:
+                st.caption("Питань від цієї команди ще не було.")
+            else:
+                unanswered = questions_df[questions_df["answer"].isna()]
+                answered = questions_df[questions_df["answer"].notna()]
+                for _, q in unanswered.iterrows():
+                    with st.container(border=True):
+                        st.write(f"❓ **{q['question']}**")
+                        st.caption(f"{q['asked_by_name']} · {q['asked_at'][:16]}")
+                        with st.form(f"answer_form_{q['id']}"):
+                            answer_text = st.text_area("Відповідь", key=f"answer_text_{q['id']}")
+                            if st.form_submit_button("💬 Надіслати відповідь") and answer_text.strip():
+                                answer_team_question(int(q["id"]), answer_text.strip())
+                                st.success("Відповідь надіслано команді.")
+                                st.rerun()
+                if not answered.empty:
+                    with st.expander(f"✅ Відповіді, надані раніше ({len(answered)})"):
+                        for _, q in answered.iterrows():
+                            st.write(f"❓ {q['question']}")
+                            st.caption(f"💬 {q['answer']} — {q['answered_by_name']}, {q['answered_at'][:16]}")
 
             with st.expander("🗑️ Видалити цю заявку команди остаточно"):
                 st.warning("Це остаточно видалить команду, її учасників, подані проєкти й файли презентацій, "
@@ -3951,6 +4145,11 @@ def page_admin_dashboard():
         attention_items.append(("📥", f"**{pending_teams}** заявок команд очікують модерації",
                                  "Перейдіть у розділ «📥 Модерація заявок»."))
 
+    unanswered_q = get_unanswered_questions_count()
+    if unanswered_q:
+        attention_items.append(("💬", f"**{unanswered_q}** питань від команд ще без відповіді",
+                                 "Відповіді можна дати в розділі «📥 Модерація заявок» під кожною командою."))
+
     today = datetime.date.today()
     upcoming_milestones = []
     if not events_all.empty:
@@ -4272,6 +4471,47 @@ def participant_my_team():
                                         "Передайте інвайт-код вручну або попросіть адміністратора налаштувати SMTP.")
                             elif inv_status and inv_status.startswith("failed"):
                                 st.warning(f"Не вдалося надіслати: {inv_status}")
+
+                with st.expander("📱 QR-код для офлайн-приєднання"):
+                    st.caption("Покажіть цей код на екрані під час реєстрації на хакатоні — новий учасник "
+                               "відсканує його камерою телефону й одразу побачить інвайт-код.")
+                    st.image(qr_code_url(t["invite_code"]), width=180)
+                    st.caption(f"Закодований інвайт-код: `{t['invite_code']}`")
+
+                if t["status"] == "Прийнято":
+                    if not PDF_LIB_AVAILABLE:
+                        st.caption("🎓 Сертифікат участі буде доступний, коли на сервері встановлять пакет `reportlab`.")
+                    else:
+                        cert_bytes = generate_team_certificate_pdf(int(t["id"]))
+                        if cert_bytes:
+                            st.download_button(
+                                "🎓 Завантажити сертифікат участі (PDF)", data=cert_bytes,
+                                file_name=f"certificate_{t['name'][:30].replace(' ', '_')}.pdf",
+                                mime="application/pdf", key=f"my_cert_dl_{t['id']}")
+
+                with st.expander("💬 Питання до організаторів"):
+                    with st.form(f"ask_question_form_{t['id']}"):
+                        new_question = st.text_area("Ваше запитання", key=f"q_text_{t['id']}",
+                                                      placeholder="Наприклад: чи можна змінити склад команди "
+                                                                  "після дедлайну реєстрації?")
+                        if st.form_submit_button("📨 Надіслати запитання") and new_question.strip():
+                            ask_team_question(int(t["id"]), new_question.strip())
+                            st.success("Запитання надіслано організаторам. Відповідь з'явиться тут.")
+                            st.rerun()
+
+                    questions_df = get_team_questions(int(t["id"]))
+                    if questions_df.empty:
+                        st.caption("Запитань ще не було.")
+                    else:
+                        for _, q in questions_df.iterrows():
+                            with st.container(border=True):
+                                st.write(f"❓ **{q['question']}**")
+                                st.caption(f"Запитав(ла): {q['asked_by_name']} · {q['asked_at'][:16]}")
+                                if q["answer"]:
+                                    st.success(f"💬 {q['answer']}")
+                                    st.caption(f"Відповів(ла): {q['answered_by_name']} · {q['answered_at'][:16]}")
+                                else:
+                                    st.info("⏳ Очікує відповіді організаторів.")
 
                 members_full = query_df("""SELECT tm.id AS membership_id, u.id AS user_id, u.full_name, u.email
                                             FROM team_members tm JOIN users u ON tm.user_id=u.id
