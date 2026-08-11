@@ -259,6 +259,10 @@ def init_db():
         team_id INTEGER, question TEXT, asked_by_id INTEGER, asked_by_name TEXT, asked_at TEXT,
         answer TEXT, answered_by_name TEXT, answered_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS team_chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, sender_id INTEGER, sender_name TEXT, body TEXT, created_at TEXT
+    )""")
     conn.commit()
 
     # м'які міграції: додаємо нові колонки, якщо їх ще немає
@@ -1046,8 +1050,8 @@ def maybe_autoclose_registration(event_id):
 
 def delete_team_cascade(team_id):
     """Остаточно видаляє команду разом з усіма пов'язаними даними: учасники, подачі, файли,
-    оцінки, лайки, історія статусів, журнал email, питання до організаторів; звільняє слоти
-    менторів і посилання оголошень."""
+    оцінки, лайки, історія статусів, журнал email, питання до організаторів, внутрішній чат;
+    звільняє слоти менторів і посилання оголошень."""
     subs = query_df("SELECT id FROM submissions WHERE team_id=?", (team_id,))
     for sid in subs["id"].tolist():
         execute("DELETE FROM files WHERE submission_id=?", (int(sid),))
@@ -1058,6 +1062,7 @@ def delete_team_cascade(team_id):
     execute("DELETE FROM team_status_log WHERE team_id=?", (team_id,))
     execute("DELETE FROM email_log WHERE team_id=?", (team_id,))
     execute("DELETE FROM team_questions WHERE team_id=?", (team_id,))
+    execute("DELETE FROM team_chat_messages WHERE team_id=?", (team_id,))
     execute("UPDATE mentor_slots SET is_booked=0, team_id=NULL WHERE team_id=?", (team_id,))
     execute("UPDATE announcements SET target_team_id=NULL WHERE target_team_id=?", (team_id,))
     execute("DELETE FROM teams WHERE id=?", (team_id,))
@@ -1375,6 +1380,23 @@ def get_unanswered_questions_count():
 
 
 # ------------------------------------------------------------
+# Внутрішній чат команди (приватний, бачать лише учасники команди —
+# на відміну від «Питань до організаторів», який бачать і адміни)
+# ------------------------------------------------------------
+
+def post_team_chat_message(team_id, body):
+    user = st.session_state.get("user") or {}
+    execute("""INSERT INTO team_chat_messages (team_id,sender_id,sender_name,body,created_at)
+               VALUES (?,?,?,?,?)""",
+            (team_id, user.get("id"), user.get("full_name", "Учасник"), body, now()))
+
+
+def get_team_chat_messages(team_id):
+    return query_df("""SELECT sender_id, sender_name, body, created_at
+                        FROM team_chat_messages WHERE team_id=? ORDER BY created_at ASC""", (team_id,))
+
+
+# ------------------------------------------------------------
 # QR-код для швидкого приєднання до команди офлайн (наприклад, на реєстрації хакатону)
 # ------------------------------------------------------------
 
@@ -1415,6 +1437,25 @@ def toggle_like(team_id):
         return False
     execute("INSERT INTO showcase_likes (team_id, voter_key, created_at) VALUES (?,?,?)", (team_id, voter, now()))
     return True
+
+
+def get_mentor_rating_stats(mentor_id):
+    """Повертає (середня_оцінка, кількість_відгуків) ментора за всіма консультаціями."""
+    row = query_one("SELECT AVG(rating), COUNT(*) FROM mentor_feedback WHERE mentor_id=?", (mentor_id,))
+    if not row or not row[1]:
+        return None, 0
+    return round(row[0], 2), row[1]
+
+
+def render_star_rating(avg_rating, count):
+    """Повертає рядок із зірками для середньої оцінки (з половинками) та підписом кількості відгуків."""
+    if avg_rating is None:
+        return "Відгуків ще немає"
+    full = int(avg_rating)
+    half = 1 if (avg_rating - full) >= 0.5 else 0
+    empty = 5 - full - half
+    stars = "⭐" * full + ("✨" if half else "") + "☆" * empty
+    return f"{stars}  {avg_rating}/5 ({count} відгук{'ів' if count != 1 else ''})"
 
 
 def parse_tags(tags_text):
@@ -4513,6 +4554,30 @@ def participant_my_team():
                                 else:
                                     st.info("⏳ Очікує відповіді організаторів.")
 
+                with st.expander("👥 Внутрішній чат команди"):
+                    st.caption("Приватне обговорення проєкту — бачать лише учасники цієї команди, "
+                               "організатори й журі сюди доступу не мають (на відміну від «Питань до організаторів»).")
+                    chat_df = get_team_chat_messages(int(t["id"]))
+                    if chat_df.empty:
+                        st.caption("Повідомлень ще немає — почніть обговорення першими.")
+                    else:
+                        chat_box = st.container(height=280)
+                        with chat_box:
+                            for _, m in chat_df.iterrows():
+                                is_me = m["sender_id"] == user["id"]
+                                align_label = "Ви" if is_me else m["sender_name"]
+                                st.markdown(f"**{align_label}** · <span style='color:gray;font-size:0.8em'>"
+                                            f"{m['created_at'][:16]}</span>", unsafe_allow_html=True)
+                                st.write(m["body"])
+                                st.markdown("---")
+                    with st.form(f"team_chat_form_{t['id']}", clear_on_submit=True):
+                        chat_msg = st.text_area("Написати команді", key=f"chat_text_{t['id']}",
+                                                 placeholder="Наприклад: пропоную зробити акцент на демо AI-модуля",
+                                                 label_visibility="collapsed")
+                        if st.form_submit_button("💬 Надіслати") and chat_msg.strip():
+                            post_team_chat_message(int(t["id"]), chat_msg.strip())
+                            st.rerun()
+
                 members_full = query_df("""SELECT tm.id AS membership_id, u.id AS user_id, u.full_name, u.email
                                             FROM team_members tm JOIN users u ON tm.user_id=u.id
                                             WHERE tm.team_id=? ORDER BY tm.id""", (t["id"],))
@@ -4598,6 +4663,85 @@ def participant_my_team():
                     st.caption(f"Поточна версія подачі: v{last_sub[4]}")
 
 
+def page_mentor_directory():
+    st.subheader("🧑‍🏫 Список менторів")
+    st.caption("Оберіть ментора для консультації, орієнтуючись на його спеціалізацію та середню оцінку "
+               "від інших команд.")
+
+    mentors = query_df("SELECT id, full_name, faculty FROM users WHERE role='mentor' ORDER BY full_name")
+    if mentors.empty:
+        st.info("Менторів ще не додано до платформи.")
+        return
+
+    events = get_events()
+    ev_map = {"Усі події": None}
+    ev_map.update(dict(zip(events["title"], events["id"])) if not events.empty else {})
+    ev_choice = st.selectbox("Показати менторів, доступних для події", list(ev_map.keys()))
+    ev_id_filter = ev_map[ev_choice]
+
+    sort_choice = st.selectbox("Сортувати за", ["Рейтингом (спадання)", "Кількістю вільних слотів", "Ім'ям"])
+
+    rows = []
+    for _, m in mentors.iterrows():
+        avg_rating, n_reviews = get_mentor_rating_stats(int(m["id"]))
+        slots_sql = "SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=? AND is_booked=0 AND slot_date>=?"
+        slots_params = [int(m["id"]), str(datetime.date.today())]
+        if ev_id_filter:
+            slots_sql += " AND event_id=?"
+            slots_params.append(ev_id_filter)
+        free_slots = query_one(slots_sql, tuple(slots_params))[0]
+
+        if ev_id_filter:
+            has_any = query_one("SELECT COUNT(*) FROM mentor_slots WHERE mentor_id=? AND event_id=?",
+                                 (int(m["id"]), ev_id_filter))[0]
+            if not has_any:
+                continue
+
+        rows.append({"id": int(m["id"]), "name": m["full_name"], "faculty": m["faculty"] or "—",
+                     "avg_rating": avg_rating, "n_reviews": n_reviews, "free_slots": free_slots})
+
+    if not rows:
+        st.info("Для обраної події менторів поки не призначено.")
+        return
+
+    if sort_choice == "Рейтингом (спадання)":
+        rows.sort(key=lambda r: (r["avg_rating"] is None, -(r["avg_rating"] or 0)))
+    elif sort_choice == "Кількістю вільних слотів":
+        rows.sort(key=lambda r: -r["free_slots"])
+    else:
+        rows.sort(key=lambda r: r["name"])
+
+    for r in rows:
+        with st.container(border=True):
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.markdown(f"### {r['name']}")
+                st.caption(f"🎓 {r['faculty']}")
+                st.write(render_star_rating(r["avg_rating"], r["n_reviews"]))
+            with c2:
+                st.metric("🟢 Вільних слотів", r["free_slots"])
+
+            recent_reviews = query_df("""SELECT rating, comment FROM mentor_feedback
+                                          WHERE mentor_id=? AND comment IS NOT NULL AND comment != ''
+                                          ORDER BY created_at DESC LIMIT 3""", (r["id"],))
+            if not recent_reviews.empty:
+                with st.expander("💬 Останні відгуки команд"):
+                    for _, rv in recent_reviews.iterrows():
+                        stars = "⭐" * int(rv["rating"]) + "☆" * (5 - int(rv["rating"]))
+                        st.write(f"{stars} — {rv['comment']}")
+
+            if r["free_slots"] > 0:
+                st.button(f"📌 Забронювати консультацію з {r['name'].split(' ')[0]}",
+                           key=f"book_mentor_{r['id']}", on_click=_goto_office_hours_with_mentor, args=(r["name"],))
+            else:
+                st.caption("Наразі немає вільних слотів у цього ментора.")
+
+
+def _goto_office_hours_with_mentor(mentor_name):
+    st.session_state["office_hours_mentor_filter"] = mentor_name
+    st.session_state["participant_menu"] = "🗓️ Office Hours"
+
+
 def participant_office_hours():
     st.subheader("🗓️ Office Hours — консультації з менторами")
     user = st.session_state.user
@@ -4635,30 +4779,47 @@ def participant_office_hours():
             st.rerun()
     else:
         st.markdown("#### Вільні слоти для консультацій перед пітчингом")
-        free_slots = query_df("""SELECT ms.id, u.full_name AS mentor, ms.slot_date, ms.start_time, ms.end_time,
-                                         ms.location
+        free_slots = query_df("""SELECT ms.id, ms.mentor_id, u.full_name AS mentor, ms.slot_date, ms.start_time,
+                                         ms.end_time, ms.location
                                   FROM mentor_slots ms JOIN users u ON ms.mentor_id=u.id
                                   WHERE ms.event_id=? AND ms.is_booked=0 AND ms.slot_date >= ?
                                   ORDER BY ms.slot_date, ms.start_time""", (event_id, today_str))
         if free_slots.empty:
             st.info("Наразі немає вільних слотів для цієї події. Спробуйте пізніше.")
         else:
-            st.dataframe(free_slots, use_container_width=True, hide_index=True)
+            mentor_names = sorted(free_slots["mentor"].unique().tolist())
+            preselect = st.session_state.pop("office_hours_mentor_filter", None)
+            options = ["Усі ментори"] + mentor_names
+            default_idx = options.index(preselect) if preselect in options else 0
+            mentor_filter = st.selectbox("🔎 Фільтр за ментором", options, index=default_idx)
+            if mentor_filter != "Усі ментори":
+                free_slots = free_slots[free_slots["mentor"] == mentor_filter]
+
+            avg_rating, n_reviews = (get_mentor_rating_stats(int(free_slots.iloc[0]["mentor_id"]))
+                                      if mentor_filter != "Усі ментори" and not free_slots.empty else (None, 0))
+            if mentor_filter != "Усі ментори":
+                st.caption(f"⭐ Рейтинг {mentor_filter}: {render_star_rating(avg_rating, n_reviews)}")
+
+            st.dataframe(free_slots[["mentor", "slot_date", "start_time", "end_time", "location"]],
+                         use_container_width=True, hide_index=True)
             slot_map = {
                 f"{row['mentor']} · {row['slot_date']} {row['start_time']}–{row['end_time']} "
                 f"({row['location'] or 'онлайн'})": row["id"]
                 for _, row in free_slots.iterrows()
             }
-            chosen = st.selectbox("Оберіть слот", list(slot_map.keys()))
-            if st.button("📌 Записатись на консультацію"):
-                slot_id = int(slot_map[chosen])
-                current = query_one("SELECT is_booked FROM mentor_slots WHERE id=?", (slot_id,))
-                if current and current[0] == 1:
-                    st.error("На жаль, цей слот щойно зайняли. Оберіть інший.")
-                else:
-                    execute("UPDATE mentor_slots SET is_booked=1, team_id=? WHERE id=?", (team_id, slot_id))
-                    st.success("Вас записано на консультацію!")
-                    st.rerun()
+            if not slot_map:
+                st.info("У цього ментора наразі немає вільних слотів. Оберіть іншого.")
+            else:
+                chosen = st.selectbox("Оберіть слот", list(slot_map.keys()))
+                if st.button("📌 Записатись на консультацію"):
+                    slot_id = int(slot_map[chosen])
+                    current = query_one("SELECT is_booked FROM mentor_slots WHERE id=?", (slot_id,))
+                    if current and current[0] == 1:
+                        st.error("На жаль, цей слот щойно зайняли. Оберіть інший.")
+                    else:
+                        execute("UPDATE mentor_slots SET is_booked=1, team_id=? WHERE id=?", (team_id, slot_id))
+                        st.success("Вас записано на консультацію!")
+                        st.rerun()
 
     # ------------------------------------------------------------
     # Минулі консультації + оцінювання ментора
@@ -4795,7 +4956,8 @@ def page_participant_dashboard():
 def page_participant():
     st.sidebar.markdown("### 🎓 Меню учасника")
     menu = st.sidebar.radio("Розділ", ["🏠 Дашборд", "📅 Календар подій", "🚀 Моя команда", "🗓️ Office Hours",
-                                        "🏆 Лідерборд", "🖼️ Портфоліо проєктів", "📢 Оголошення", "👤 Профіль"],
+                                        "🧑‍🏫 Список менторів", "🏆 Лідерборд", "🖼️ Портфоліо проєктів",
+                                        "📢 Оголошення", "👤 Профіль"],
                              key="participant_menu")
     if menu == "🏠 Дашборд":
         page_participant_dashboard()
@@ -4805,6 +4967,8 @@ def page_participant():
         participant_my_team()
     elif menu == "🗓️ Office Hours":
         participant_office_hours()
+    elif menu == "🧑‍🏫 Список менторів":
+        page_mentor_directory()
     elif menu == "🏆 Лідерборд":
         page_leaderboard()
     elif menu == "🖼️ Портфоліо проєктів":
